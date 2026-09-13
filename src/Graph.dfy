@@ -651,6 +651,105 @@
 // "bbx"/"bbyyy") and the longest run of 'y' is 3 (from "ayyy"): it still accepts every
 // sample but now correctly rejects "bbbx" and "ayyyy" too (confirmed empirically; see
 // GraphTests.dfy's updated TestSelfLoopToPlusTightening and its new fuzz-style companion).
+//
+// ROUND 13 does for SCC-contraction (and, for free, its CollapseAllGraph special case -
+// CollapseAllGraph is literally ContractSCCGraph(g, InteriorNodes(g), maxLen), confirmed
+// still true after this round) exactly what Round 12 did for self-loop-to-Plus: replaces
+// the unbounded Star(UnionAllLabels(g,cs)) (Round 5) with a tight
+// RepRange(UnionAllLabels(g,cs), 0, maxLen) - the last remaining unbounded Star/Plus in
+// this file.
+//
+// Investigation required first (per the task that spawned this round): unlike the
+// self-loop case, where the looped node's label is ALWAYS a bare Sym(c) (guaranteed
+// never to match "" - see Round 12's own comment for why that structural fact holds for
+// every self-loop this pipeline ever produces), an SCC member's CURRENT label can, by the
+// time SCC-detection runs, already be something built up by an EARLIER contraction in the
+// same pipeline run. Tracing through the driver's actual priority order
+// (simple-path -> self-loop -> exact-merge -> optional -> SCC-detection -> ...,
+// unchanged since Round 10), this turns out to be a real, empirically CONFIRMED
+// possibility, not just a hypothetical: CanMakeOptional's precondition never rules out v
+// being part of a longer cycle (only a direct self-loop on v is excluded) - it only
+// requires that every parent-of-v/child-of-v pair already has a direct "bypass" edge, and
+// nothing stops that bypass edge from being redundant with a longer real cycle running
+// through v's own (untouched) edges. Concretely: S =
+// {"pqrpr", "pw", "zr"} builds a bigram graph where FindOptionalNode fires on 'q' first
+// (Preds(q)={p}, Succs(q)={r}, bypass edge (p,r) already present from the "pr" in
+// "pqrpr"), turning q's label into Opt(Sym('q')) and removing just that one bypass edge -
+// but the genuine 3-cycle p->q->r->p survives entirely (none of ITS edges were the
+// removed bypass), and FindNontrivialSCC subsequently finds and contracts exactly
+// {p,q,r}, folding the now-nullable Opt(Sym('q')) directly into UnionAllLabels as one of
+// its disjuncts. Confirmed via a scratch probe: InferViaBigramGraph({"pqrpr","pw","zr"})
+// produces a label of the shape z?(p|q?|r)*w? (before this round's RepRange fix) - the
+// "q?" sitting directly inside the Star/Union confirms a nullable member really did reach
+// SCC-contraction.
+//
+// Why the simple maxLen bound (Round 12's own MaxRunOverSet-style fold, generalized here
+// to MaxLenOverSet(S) := max over w in S of |w| - the same simplest-safe-choice already
+// used for other rounds' bounds, not a tighter substring-local bound, which would also be
+// valid but isn't required) stays SOUND even given that finding, without falling back to
+// the coarser "maxLen + |C|" over-approximation the task anticipated as a fallback: the
+// natural "peel one run-step at a time" argument (UnionKCopiesOfRun, mirroring Round 12's
+// KCopiesOfRunAccepts but generalized from "a run of one repeated node" to "a run of
+// arbitrary C-members" via UnionAllLabelsSound) still only ever produces
+// MatchesKCopies(UnionAllLabels(g,cs), s, k) for k := the run's own ACTUAL length - which
+// could, in principle, be inflated arbitrarily far beyond |s| if some witnessing walk
+// happens to revisit a nullable member many times, each time consuming "" (GraphAccepts's
+// own existential makes no promise the chosen witness walk is "minimal"). The fix is a
+// new, fully general fact independent of any nullability hypothesis at all -
+// CompressKCopies(r,s,k) returns some k' <= |s| with MatchesKCopies(r,s,k') still - proved
+// by stripping every zero-length piece out of the k-copies witness (concatenating a ""
+// piece into a sequence of substrings never changes their overall concatenation, so
+// dropping it - keeping every OTHER piece's own boundaries exactly as they were - still
+// witnesses the exact same s): nonempty pieces each contribute exactly 1 towards k' and
+// >= 1 towards |s|, so k' can never exceed |s|, while empty pieces contribute 0 to both
+// and are simply dropped. Since |s| <= |w| <= maxLen for the actual accepted sample w,
+// this gives exactly the 0 <= k' <= maxLen MatchesKCopiesImpliesRepRange needs - with NO
+// hypothesis anywhere about which (if any) of C's members are nullable. (One
+// self-contained wrinkle Star's own existential can't provide, echoing Round 12's own
+// note about Plus: Star/Union's existentials never remember which repetition count was
+// actually used, so UnionKCopiesOfRun builds MatchesKCopies directly instead, exactly as
+// KCopiesOfRunAccepts already did for the self-loop case.)
+//
+// The fix: ContractSCCGraph/CollapseAllGraph (and every supporting WF/AllLabelsSore/
+// PairwiseDisjoint/Sound/Exec* lemma) now take an explicit maxLen parameter, threaded
+// through to RepRange(UnionAllLabels(g,cs), 0, maxLen) in place of the old
+// Star(UnionAllLabels(g,cs)); InferViaBigramGraph computes maxLen := MaxLenOverSet(S)
+// once, up front (mirroring w0's own one-time computation), and passes it to both call
+// sites (the FindNontrivialSCC branch's ExecContractSCC, and the TopoSort-fails defensive
+// fallback's ExecCollapseAll) and to FinishSingleInteriorNode (whose own self-loop
+// canonicalization step - contracting the final singleton {m} - is just another
+// ContractSCCGraph application under the hood, so needs the exact same bound threaded
+// through too). ExecContractSCC/ExecCollapseAll's own acceptance-preservation postcondition
+// is now conditioned on `|w| <= maxLen` (a bounded RepRange, unlike the old unbounded
+// Star, genuinely cannot accept a sample requiring more repetitions than that) - mirroring
+// exactly how Round 12's LoopToPlusSound/LoopStepLoopToPlus already conditioned their own
+// postcondition on `LongestRun(w,c) <= maxRun`; the driver discharges this per w in S via
+// an explicit forall block at each of the three call sites (rather than leaning on
+// automatic quantifier instantiation of an ambient conditioned-implication hypothesis, in
+// the same explicit-over-automatic spirit this file's module header already recommends).
+//
+// Proof-tractability note: ContractSCCSound's own `assert StepsOk(g, walk, splits, w) by
+// {...}` block - present, unchanged, since Round 5 - started failing under `dafny
+// test`/`dafny build` (while still verifying cleanly under plain `dafny verify`) once this
+// round's new lemmas were added nearby, the exact `dafny verify`-clean-but-build/test-
+// flaky pattern this file's module header already documents at length. The fix mirrors
+// ContractSimplePathSound's own (already-robust) version of the identical block: make the
+// second forall's body explicit (an empty-bodied `forall i | ... ensures ... {}` for the
+// per-index Matches conjunct) rather than leaving it to follow automatically from
+// ExtractWalkSplits's ensures - MergeAnySound/MakeOptionalSound still use the more
+// fragile single-forall form and happened not to be pushed over the edge by this round's
+// changes, so they were left untouched rather than "fixed" pre-emptively.
+//
+// Example: for S = {"xab", "xba"} (Round 8's own running example), before this round
+// InferViaBigramGraph produced Concat(Sym('x'),Star(Union(Sym('a'),Sym('b')))) - i.e.
+// x(a|b)* - which wrongly accepted arbitrarily long runs of 'a'/'b' (e.g. "xaaaa",
+// "xababab"). After this round it produces
+// Concat(Sym('x'),RepRange(Union(Sym('a'),Sym('b')),0,3)) - i.e. x[ab]{0,3} - since the
+// longest sample is 3 characters ("xab"/"xba" are both length 3): it still accepts every
+// sample (each needs only 2 repetitions of the cycle) but now correctly rejects "xaaaa"
+// (one more repetition than the bound allows), "xaabb" and "xababab" too (confirmed
+// empirically; see GraphTests.dfy's updated TestNontrivialSCCTightening and its new
+// fuzz-style companion, TestSCCFuzzGenuineMultiNodeCycles).
 module BigramGraph {
   import opened RegexCore
 
@@ -2422,26 +2521,96 @@ module BigramGraph {
     }
   }
 
-  ghost function ContractSCCGraph(g: Graph, C: set<int>): Graph
+  // ==================================================================================
+  // ROUND 13: tight RepRange bound for SCC-contraction, replacing the unbounded
+  // Star(UnionAllLabels(g,cs)) below with RepRange(UnionAllLabels(g,cs), 0, maxLen) -
+  // see this file's header comment for the full derivation, the empirically-confirmed
+  // finding that a genuine SCC member CAN carry a nullable label by the time
+  // SCC-detection runs (unlike Round 12's self-loop case, where the looped node's label
+  // is always a bare Sym(c)), and why the bound below stays sound regardless.
+  //
+  // maxLen folds |w| over the ORIGINAL top-level input set S, exactly mirroring Round
+  // 12's MaxRunOverSet fold (and Chain.dfy's own MaxLen/MaxLenBound, that file's
+  // unrelated wildcard-fallback analogue) - the simplest, directly-computable global
+  // bound: every sample's own walk through the contracted SCC can never need more
+  // repetitions than the sample's own total length, so the max over every sample
+  // trivially bounds all of them at once.
+  // ==================================================================================
+
+  method MaxLenOverSet(S: set<string>) returns (m: nat)
+    ensures forall w :: w in S ==> |w| <= m
+  {
+    m := 0;
+    var rem := S;
+    while rem != {}
+      invariant forall w :: w in S - rem ==> |w| <= m
+      decreases rem
+    {
+      var w :| w in rem;
+      if |w| > m {
+        m := |w|;
+      }
+      rem := rem - {w};
+    }
+  }
+
+  // General fact about MatchesKCopies, independent of any particular r: any witness that
+  // s splits into k copies of r can be COMPRESSED to a witness using only k' <= |s|
+  // copies, by stripping out every zero-length piece (concatenating a "" piece into a
+  // sequence of substrings never changes their overall concatenation, so dropping it -
+  // while keeping every OTHER piece's own boundaries exactly as they were - still
+  // witnesses the exact same s). This is the key fact that makes a FINITE RepRange bound
+  // sound for SCC-contraction even when some of C's members carry a NULLABLE label
+  // (confirmed possible - see the file header comment): it needs no hypothesis at all
+  // about non-nullability, unlike Round 12's self-loop case, which genuinely relied on
+  // g.labels[v] never matching "" (Plus's own definition can never witness "" even when
+  // its argument is nullable - see CanLoopToPlus's own comment). Nonempty pieces each
+  // contribute exactly 1 towards k' and >= 1 towards |s|, so k' can never exceed |s|;
+  // empty pieces contribute 0 to both and are simply dropped.
+  lemma CompressKCopies(r: Regex, s: string, k: nat) returns (k': nat)
+    requires MatchesKCopies(r, s, k)
+    ensures k' <= |s|
+    ensures MatchesKCopies(r, s, k')
+    decreases k
+  {
+    if k == 0 {
+      k' := 0;
+    } else {
+      var i :| 0 <= i <= |s| && Matches(r, s[..i]) && MatchesKCopies(r, s[i..], k - 1);
+      var restK := CompressKCopies(r, s[i..], k - 1);
+      if i == 0 {
+        assert s[i..] == s;
+        k' := restK;
+      } else {
+        k' := restK + 1;
+        assert restK <= |s| - i;
+        assert MatchesKCopies(r, s, k') by {
+          assert 0 <= i <= |s| && Matches(r, s[..i]) && MatchesKCopies(r, s[i..], restK);
+        }
+      }
+    }
+  }
+
+  ghost function ContractSCCGraph(g: Graph, C: set<int>, maxLen: nat): Graph
     requires WF(g)
     requires CanContractSCC(g, C)
   {
     var cs := SetToSeq(C);
     var m := FreshNode(g.nodes);
     var nodes' := g.nodes - C + {m};
-    var labels' := (map n | n in g.nodes - C :: n := g.labels[n])[m := Star(UnionAllLabels(g, cs))];
+    var labels' := (map n | n in g.nodes - C :: n := g.labels[n])[m := RepRange(UnionAllLabels(g, cs), 0, maxLen)];
     var untouched := set e | e in g.edges && e.0 !in C && e.1 !in C :: e;
     var into_m := set p | p in g.nodes && p !in C && (exists c :: c in C && (p, c) in g.edges) :: (p, m);
     var outof_m := set q | q in g.nodes && q !in C && (exists c :: c in C && (c, q) in g.edges) :: (m, q);
     Graph(nodes', labels', untouched + into_m + outof_m, g.start, g.end)
   }
 
-  lemma ContractSCCWF(g: Graph, C: set<int>)
+  lemma ContractSCCWF(g: Graph, C: set<int>, maxLen: nat)
     requires WF(g)
     requires CanContractSCC(g, C)
-    ensures WF(ContractSCCGraph(g, C))
+    ensures WF(ContractSCCGraph(g, C, maxLen))
   {
-    var g' := ContractSCCGraph(g, C);
+    var g' := ContractSCCGraph(g, C, maxLen);
     var m := FreshNode(g.nodes);
     assert g'.start in g'.nodes && g'.end in g'.nodes;
     forall e | e in g'.edges ensures e.0 in g'.nodes && e.1 in g'.nodes {
@@ -2455,43 +2624,43 @@ module BigramGraph {
     }
   }
 
-  lemma ContractSCCAllLabelsSore(g: Graph, C: set<int>)
+  lemma ContractSCCAllLabelsSore(g: Graph, C: set<int>, maxLen: nat)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires CanContractSCC(g, C)
-    ensures WF(ContractSCCGraph(g, C))
-    ensures AllLabelsSore(ContractSCCGraph(g, C))
+    ensures WF(ContractSCCGraph(g, C, maxLen))
+    ensures AllLabelsSore(ContractSCCGraph(g, C, maxLen))
   {
-    ContractSCCWF(g, C);
-    var g' := ContractSCCGraph(g, C);
+    ContractSCCWF(g, C, maxLen);
+    var g' := ContractSCCGraph(g, C, maxLen);
     var m := FreshNode(g.nodes);
     var cs := SetToSeq(C);
     forall n | n in g'.nodes ensures IsSore(g'.labels[n]) {
       if n == m {
         UnionAllLabelsIsSore(g, cs);
-        StarIsSore(UnionAllLabels(g, cs));
+        RepRangeIsSore(UnionAllLabels(g, cs), 0, maxLen);
       }
     }
   }
 
-  lemma ContractSCCPairwiseDisjoint(g: Graph, C: set<int>)
+  lemma ContractSCCPairwiseDisjoint(g: Graph, C: set<int>, maxLen: nat)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires CanContractSCC(g, C)
-    ensures WF(ContractSCCGraph(g, C))
-    ensures PairwiseDisjointLabels(ContractSCCGraph(g, C))
+    ensures WF(ContractSCCGraph(g, C, maxLen))
+    ensures PairwiseDisjointLabels(ContractSCCGraph(g, C, maxLen))
   {
-    ContractSCCWF(g, C);
-    var g' := ContractSCCGraph(g, C);
+    ContractSCCWF(g, C, maxLen);
+    var g' := ContractSCCGraph(g, C, maxLen);
     var m := FreshNode(g.nodes);
     var cs := SetToSeq(C);
     forall n1, n2 | n1 in g'.nodes && n2 in g'.nodes && n1 != n2
       ensures forall ch :: Symbols(g'.labels[n1])[ch] == 0 || Symbols(g'.labels[n2])[ch] == 0
     {
       if n1 == m {
-        assert g'.labels[n1] == Star(UnionAllLabels(g, cs));
+        assert g'.labels[n1] == RepRange(UnionAllLabels(g, cs), 0, maxLen);
         assert Symbols(g'.labels[n1]) == Symbols(UnionAllLabels(g, cs));
         forall ch ensures Symbols(g'.labels[n1])[ch] == 0 || Symbols(g'.labels[n2])[ch] == 0 {
           if Symbols(g'.labels[n1])[ch] > 0 {
@@ -2502,7 +2671,7 @@ module BigramGraph {
           }
         }
       } else if n2 == m {
-        assert g'.labels[n2] == Star(UnionAllLabels(g, cs));
+        assert g'.labels[n2] == RepRange(UnionAllLabels(g, cs), 0, maxLen);
         assert Symbols(g'.labels[n2]) == Symbols(UnionAllLabels(g, cs));
         forall ch ensures Symbols(g'.labels[n1])[ch] == 0 || Symbols(g'.labels[n2])[ch] == 0 {
           if Symbols(g'.labels[n2])[ch] > 0 {
@@ -2525,27 +2694,27 @@ module BigramGraph {
   // need to re-derive them by re-unfolding ContractSCCGraph's comprehension-heavy body
   // (in particular the existentially-quantified into_m/outof_m sets) from scratch at
   // every one of its recursive calls. This is exactly what caused it to time out.
-  lemma ContractSCCEdgeUntouched(g: Graph, C: set<int>, a: int, b: int)
+  lemma ContractSCCEdgeUntouched(g: Graph, C: set<int>, maxLen: nat, a: int, b: int)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires (a, b) in g.edges && a !in C && b !in C
-    ensures (a, b) in ContractSCCGraph(g, C).edges
+    ensures (a, b) in ContractSCCGraph(g, C, maxLen).edges
   {
   }
 
-  lemma ContractSCCEdgeIntoM(g: Graph, C: set<int>, p: int, c: int)
+  lemma ContractSCCEdgeIntoM(g: Graph, C: set<int>, maxLen: nat, p: int, c: int)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires p in g.nodes && p !in C && c in C && (p, c) in g.edges
-    ensures (p, FreshNode(g.nodes)) in ContractSCCGraph(g, C).edges
+    ensures (p, FreshNode(g.nodes)) in ContractSCCGraph(g, C, maxLen).edges
   {
   }
 
-  lemma ContractSCCEdgeOutOfM(g: Graph, C: set<int>, q: int, c: int)
+  lemma ContractSCCEdgeOutOfM(g: Graph, C: set<int>, maxLen: nat, q: int, c: int)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires q in g.nodes && q !in C && c in C && (c, q) in g.edges
-    ensures (FreshNode(g.nodes), q) in ContractSCCGraph(g, C).edges
+    ensures (FreshNode(g.nodes), q) in ContractSCCGraph(g, C, maxLen).edges
   {
   }
 
@@ -2600,9 +2769,15 @@ module BigramGraph {
   }
 
   // If every step of `run` matches its own label and all its nodes are in C, the whole
-  // run's concatenated substring matches Star(UnionAllLabels(g,C)) - built up one
-  // run-step at a time via Star's own existential definition.
-  lemma StarOfUnionAccepts(g: Graph, C: set<int>, cs: seq<int>, run: seq<int>, splits: seq<nat>, w: string)
+  // run's concatenated substring splits into |run| copies of UnionAllLabels(g,cs).
+  // ROUND 13: replaces StarOfUnionAccepts. Builds MatchesKCopies(UnionAllLabels(g,cs),
+  // ..., |run|) directly (mirroring Round 12's KCopiesOfRunAccepts, generalized from "a
+  // run of one repeated node" to "a run of arbitrary C-members" via UnionAllLabelsSound)
+  // instead of Star's own self-referential existential - Star's existential never
+  // remembers which repetition count was actually used (exactly the same problem Round
+  // 12's header comment already documents for Plus), so there would be no explicit k left
+  // to hand CompressKCopies/MatchesKCopiesImpliesRepRange afterwards.
+  lemma UnionKCopiesOfRun(g: Graph, C: set<int>, cs: seq<int>, run: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires C <= g.nodes
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
@@ -2614,22 +2789,26 @@ module BigramGraph {
                var lo := splits[i]; var hi := splits[i + 1];
                lo <= hi <= |w| && Matches(g.labels[run[i]], w[lo..hi])
     ensures splits[0] <= splits[|run|] <= |w|
-    ensures Matches(Star(UnionAllLabels(g, cs)), w[splits[0]..splits[|run|]])
+    ensures MatchesKCopies(UnionAllLabels(g, cs), w[splits[0]..splits[|run|]], |run|)
     decreases |run|
   {
     if |run| == 0 {
       assert w[splits[0]..splits[0]] == "";
     } else {
-      StarOfUnionAccepts(g, C, cs, run[1..], splits[1..], w);
+      UnionKCopiesOfRun(g, C, cs, run[1..], splits[1..], w);
       assert Matches(g.labels[run[0]], w[splits[0]..splits[1]]);
       assert run[0] in cs;
       UnionAllLabelsSound(g, cs, run[0], w[splits[0]..splits[1]]);
       assert Matches(UnionAllLabels(g, cs), w[splits[0]..splits[1]]);
-      assert Matches(Star(UnionAllLabels(g, cs)), w[splits[1]..splits[|run|]]);
-      assert Matches(Star(UnionAllLabels(g, cs)), w[splits[0]..splits[|run|]]) by {
-        assert 0 <= splits[1] - splits[0] <= splits[|run|] - splits[0];
-        assert w[splits[0]..splits[|run|]][..splits[1] - splits[0]] == w[splits[0]..splits[1]];
-        assert w[splits[0]..splits[|run|]][splits[1] - splits[0]..] == w[splits[1]..splits[|run|]];
+      assert MatchesKCopies(UnionAllLabels(g, cs), w[splits[1]..splits[|run|]], |run| - 1);
+      SliceSplit(w, splits[0], splits[1], splits[|run|]);
+      var s := w[splits[0]..splits[|run|]];
+      var idx := splits[1] - splits[0];
+      assert s[..idx] == w[splits[0]..splits[1]];
+      assert s[idx..] == w[splits[1]..splits[|run|]];
+      assert MatchesKCopies(UnionAllLabels(g, cs), s, |run|) by {
+        assert 0 <= idx <= |s|;
+        assert Matches(UnionAllLabels(g, cs), s[..idx]) && MatchesKCopies(UnionAllLabels(g, cs), s[idx..], |run| - 1);
       }
     }
   }
@@ -2647,14 +2826,15 @@ module BigramGraph {
   // is itself the fix for a genuine 30s solver timeout the single-lemma version hit -
   // splitting let each case's proof obligations be checked independently instead of as
   // one combined goal.
-  lemma CollapseStepsPreserves(g: Graph, C: set<int>, m: int, g': Graph,
+  lemma CollapseStepsPreserves(g: Graph, C: set<int>, maxLen: nat, m: int, g': Graph,
                                 walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires m == FreshNode(g.nodes)
-    requires g' == ContractSCCGraph(g, C)
+    requires g' == ContractSCCGraph(g, C, maxLen)
     requires ValidSteps(g, walk)
     requires StepsOk(g, walk, splits, w)
+    requires |w| <= maxLen
     ensures WF(g')
     ensures ValidSteps(g', CollapseRuns(walk, C, m))
     ensures StepsOk(g', CollapseRuns(walk, C, m), CollapseSplits(walk, splits, C, m), w)
@@ -2665,21 +2845,22 @@ module BigramGraph {
     if |walk| == 0 {
       // ValidSteps requires |walk| >= 1, so this case is vacuous - nothing to prove.
     } else if walk[0] !in C {
-      CollapseStepsPreservesUntouched(g, C, m, g', walk, splits, w);
+      CollapseStepsPreservesUntouched(g, C, maxLen, m, g', walk, splits, w);
     } else {
-      CollapseStepsPreservesRun(g, C, m, g', walk, splits, w);
+      CollapseStepsPreservesRun(g, C, maxLen, m, g', walk, splits, w);
     }
   }
 
-  lemma CollapseStepsPreservesUntouched(g: Graph, C: set<int>, m: int, g': Graph,
+  lemma CollapseStepsPreservesUntouched(g: Graph, C: set<int>, maxLen: nat, m: int, g': Graph,
                                 walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires m == FreshNode(g.nodes)
-    requires g' == ContractSCCGraph(g, C)
+    requires g' == ContractSCCGraph(g, C, maxLen)
     requires ValidSteps(g, walk)
     requires StepsOk(g, walk, splits, w)
     requires |walk| >= 1 && walk[0] !in C
+    requires |w| <= maxLen
     ensures WF(g')
     ensures ValidSteps(g', CollapseRuns(walk, C, m))
     ensures StepsOk(g', CollapseRuns(walk, C, m), CollapseSplits(walk, splits, C, m), w)
@@ -2687,7 +2868,7 @@ module BigramGraph {
     ensures CollapseSplits(walk, splits, C, m)[|CollapseRuns(walk, C, m)|] == splits[|walk|]
     decreases |walk|, 0
   {
-    ContractSCCWF(g, C);
+    ContractSCCWF(g, C, maxLen);
     var walk' := CollapseRuns(walk, C, m);
     var splits' := CollapseSplits(walk, splits, C, m);
     {
@@ -2727,7 +2908,7 @@ module BigramGraph {
             assert restWalk[i] == walk[i + 1] && restWalk[i + 1] == walk[i + 2];
           }
         }
-        CollapseStepsPreserves(g, C, m, g', restWalk, restSplits, w);
+        CollapseStepsPreserves(g, C, maxLen, m, g', restWalk, restSplits, w);
         var restWalk' := CollapseRuns(restWalk, C, m);
         var restSplits' := CollapseSplits(restWalk, restSplits, C, m);
         assert walk' == [walk[0]] + restWalk';
@@ -2737,10 +2918,10 @@ module BigramGraph {
           assert (walk[0], restWalk[0]) in g.edges;
           assert (walk[0], restWalk'[0]) in g'.edges by {
             if restWalk[0] in C {
-              ContractSCCEdgeIntoM(g, C, walk[0], restWalk[0]);
+              ContractSCCEdgeIntoM(g, C, maxLen, walk[0], restWalk[0]);
               assert restWalk'[0] == m;
             } else {
-              ContractSCCEdgeUntouched(g, C, walk[0], restWalk[0]);
+              ContractSCCEdgeUntouched(g, C, maxLen, walk[0], restWalk[0]);
               assert restWalk'[0] == restWalk[0];
             }
           }
@@ -2758,15 +2939,16 @@ module BigramGraph {
     }
   }
 
-  lemma {:timeLimitMultiplier 24} CollapseStepsPreservesRun(g: Graph, C: set<int>, m: int, g': Graph,
+  lemma {:timeLimitMultiplier 24} CollapseStepsPreservesRun(g: Graph, C: set<int>, maxLen: nat, m: int, g': Graph,
                                 walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires m == FreshNode(g.nodes)
-    requires g' == ContractSCCGraph(g, C)
+    requires g' == ContractSCCGraph(g, C, maxLen)
     requires ValidSteps(g, walk)
     requires StepsOk(g, walk, splits, w)
     requires |walk| >= 1 && walk[0] in C
+    requires |w| <= maxLen
     ensures WF(g')
     ensures ValidSteps(g', CollapseRuns(walk, C, m))
     ensures StepsOk(g', CollapseRuns(walk, C, m), CollapseSplits(walk, splits, C, m), w)
@@ -2774,7 +2956,7 @@ module BigramGraph {
     ensures CollapseSplits(walk, splits, C, m)[|CollapseRuns(walk, C, m)|] == splits[|walk|]
     decreases |walk|, 0
   {
-    ContractSCCWF(g, C);
+    ContractSCCWF(g, C, maxLen);
     var cs := SetToSeq(C);
     var walk' := CollapseRuns(walk, C, m);
     var splits' := CollapseSplits(walk, splits, C, m);
@@ -2821,14 +3003,29 @@ module BigramGraph {
         assert var lo := runSplits[0]; var hi := runSplits[1]; lo <= hi <= |w|;
       }
       SplitsOkImpliesForall(g, run, runSplits, w);
-      StarOfUnionAccepts(g, C, cs, run, runSplits, w);
+      UnionKCopiesOfRun(g, C, cs, run, runSplits, w);
       assert splits[0] <= splits[k] <= |w| by {
         assert runSplits[0] <= runSplits[k] <= |w|;
       }
-      assert Matches(Star(UnionAllLabels(g, cs)), w[splits[0]..splits[k]]) by {
+      assert MatchesKCopies(UnionAllLabels(g, cs), w[splits[0]..splits[k]], k) by {
         assert w[splits[0]..splits[k]] == w[runSplits[0]..runSplits[k]];
+        assert k == |run|;
       }
-      assert g'.labels[m] == Star(UnionAllLabels(g, cs));
+      // ROUND 13: rather than reusing k (the run's own actual length - possibly
+      // inflated far beyond |w|, e.g. if a nullable C-member's zero-length pieces got
+      // repeated many times in this particular witness walk - see the file header
+      // comment), compress the k-copies witness down to some kBounded <= the piece's own
+      // length (CompressKCopies, which needs no non-nullability hypothesis at all), which
+      // is in turn <= |w| <= maxLen - exactly the count MatchesKCopiesImpliesRepRange
+      // needs to conclude the bounded RepRange match below.
+      var piece := w[splits[0]..splits[k]];
+      var kBounded := CompressKCopies(UnionAllLabels(g, cs), piece, k);
+      assert kBounded <= |piece|;
+      assert |piece| == splits[k] - splits[0];
+      assert |piece| <= |w|;
+      MatchesKCopiesImpliesRepRange(UnionAllLabels(g, cs), 0, maxLen, kBounded, piece);
+      assert Matches(RepRange(UnionAllLabels(g, cs), 0, maxLen), w[splits[0]..splits[k]]);
+      assert g'.labels[m] == RepRange(UnionAllLabels(g, cs), 0, maxLen);
 
       if |afterRun| == 0 {
         assert walk' == [m] + CollapseRuns(afterRun, C, m);
@@ -2865,7 +3062,7 @@ module BigramGraph {
         assert afterRun == walk[k..] && afterSplits == splits[k..];
         StepsOkSuffix(g, walk, splits, w, k);
         assert StepsOk(g, afterRun, afterSplits, w);
-        CollapseStepsPreserves(g, C, m, g', afterRun, afterSplits, w);
+        CollapseStepsPreserves(g, C, maxLen, m, g', afterRun, afterSplits, w);
         var afterWalk' := CollapseRuns(afterRun, C, m);
         var afterSplits' := CollapseSplits(afterRun, afterSplits, C, m);
         assert walk' == [m] + afterWalk';
@@ -2882,7 +3079,7 @@ module BigramGraph {
               assert (walk[k - 1], walk[k]) in g.edges;
             }
             if afterWalk'[0] == afterRun[0] {
-              ContractSCCEdgeOutOfM(g, C, afterRun[0], run[k - 1]);
+              ContractSCCEdgeOutOfM(g, C, maxLen, afterRun[0], run[k - 1]);
             } else {
               // afterRun[0] itself starts a further, disjoint C-run only if afterRun[0]
               // in C, which contradicts afterRun[0] !in C established above - so
@@ -2947,17 +3144,18 @@ module BigramGraph {
     }
   }
 
-  lemma ContractSCCSound(g: Graph, C: set<int>, w: string)
+  lemma ContractSCCSound(g: Graph, C: set<int>, maxLen: nat, w: string)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires CanContractSCC(g, C)
     requires GraphAccepts(g, w)
-    ensures WF(ContractSCCGraph(g, C))
-    ensures GraphAccepts(ContractSCCGraph(g, C), w)
+    requires |w| <= maxLen
+    ensures WF(ContractSCCGraph(g, C, maxLen))
+    ensures GraphAccepts(ContractSCCGraph(g, C, maxLen), w)
   {
-    var g' := ContractSCCGraph(g, C);
-    ContractSCCWF(g, C);
+    var g' := ContractSCCGraph(g, C, maxLen);
+    ContractSCCWF(g, C, maxLen);
     var m := FreshNode(g.nodes);
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
     assert IsWalk(g, walk);
@@ -2970,8 +3168,12 @@ module BigramGraph {
     assert StepsOk(g, walk, splits, w) by {
       forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
       }
+      forall i | 0 <= i < |walk|
+        ensures var lo := splits[i]; var hi := splits[i + 1]; lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi])
+      {
+      }
     }
-    CollapseStepsPreserves(g, C, m, g', walk, splits, w);
+    CollapseStepsPreserves(g, C, maxLen, m, g', walk, splits, w);
     var walk' := CollapseRuns(walk, C, m);
     var splits' := CollapseSplits(walk, splits, C, m);
     assert walk[0] == g.start && walk[0] !in C;
@@ -3088,61 +3290,62 @@ module BigramGraph {
     g.nodes - {g.start, g.end}
   }
 
-  ghost function CollapseAllGraph(g: Graph): Graph
+  ghost function CollapseAllGraph(g: Graph, maxLen: nat): Graph
     requires WF(g)
     requires InteriorNodes(g) != {}
   {
-    ContractSCCGraph(g, InteriorNodes(g))
+    ContractSCCGraph(g, InteriorNodes(g), maxLen)
   }
 
-  lemma CollapseAllWF(g: Graph)
+  lemma CollapseAllWF(g: Graph, maxLen: nat)
     requires WF(g)
     requires InteriorNodes(g) != {}
-    ensures WF(CollapseAllGraph(g))
+    ensures WF(CollapseAllGraph(g, maxLen))
   {
     assert CanContractSCC(g, InteriorNodes(g));
-    ContractSCCWF(g, InteriorNodes(g));
+    ContractSCCWF(g, InteriorNodes(g), maxLen);
   }
 
-  lemma CollapseAllAllLabelsSore(g: Graph)
+  lemma CollapseAllAllLabelsSore(g: Graph, maxLen: nat)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires InteriorNodes(g) != {}
-    ensures WF(CollapseAllGraph(g))
-    ensures AllLabelsSore(CollapseAllGraph(g))
+    ensures WF(CollapseAllGraph(g, maxLen))
+    ensures AllLabelsSore(CollapseAllGraph(g, maxLen))
   {
     assert CanContractSCC(g, InteriorNodes(g));
-    ContractSCCAllLabelsSore(g, InteriorNodes(g));
+    ContractSCCAllLabelsSore(g, InteriorNodes(g), maxLen);
   }
 
-  lemma CollapseAllPairwiseDisjoint(g: Graph)
+  lemma CollapseAllPairwiseDisjoint(g: Graph, maxLen: nat)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires InteriorNodes(g) != {}
-    ensures WF(CollapseAllGraph(g))
-    ensures PairwiseDisjointLabels(CollapseAllGraph(g))
+    ensures WF(CollapseAllGraph(g, maxLen))
+    ensures PairwiseDisjointLabels(CollapseAllGraph(g, maxLen))
   {
     assert CanContractSCC(g, InteriorNodes(g));
-    ContractSCCPairwiseDisjoint(g, InteriorNodes(g));
+    ContractSCCPairwiseDisjoint(g, InteriorNodes(g), maxLen);
   }
 
   // Like ContractSCCSound/MergeAnySound/MakeOptionalSound, this carries AllLabelsSore/
   // PairwiseDisjointLabels as preconditions too, matching this file's existing "…Sound"
   // lemma convention (ContractSimplePathSound is the one exception that doesn't need
   // them) - CollapseAllSound just forwards to ContractSCCSound, which requires them.
-  lemma CollapseAllSound(g: Graph, w: string)
+  lemma CollapseAllSound(g: Graph, maxLen: nat, w: string)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires InteriorNodes(g) != {}
     requires GraphAccepts(g, w)
-    ensures WF(CollapseAllGraph(g))
-    ensures GraphAccepts(CollapseAllGraph(g), w)
+    requires |w| <= maxLen
+    ensures WF(CollapseAllGraph(g, maxLen))
+    ensures GraphAccepts(CollapseAllGraph(g, maxLen), w)
   {
     assert CanContractSCC(g, InteriorNodes(g));
-    ContractSCCSound(g, InteriorNodes(g), w);
+    ContractSCCSound(g, InteriorNodes(g), maxLen, w);
   }
 
   // ---- The "last mile" fact: a single interior node's own label already IS the answer ----
@@ -3465,13 +3668,13 @@ module BigramGraph {
   {
   }
 
-  lemma ContractSCCNoBackEdges(g: Graph, C: set<int>)
+  lemma ContractSCCNoBackEdges(g: Graph, C: set<int>, maxLen: nat)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires NoBackEdges(g)
-    ensures NoBackEdges(ContractSCCGraph(g, C))
+    ensures NoBackEdges(ContractSCCGraph(g, C, maxLen))
   {
-    var g' := ContractSCCGraph(g, C);
+    var g' := ContractSCCGraph(g, C, maxLen);
     var m := FreshNode(g.nodes);
     forall e | e in g'.edges ensures e.1 != g.start {
       if e.0 != m && e.1 != m {
@@ -3489,13 +3692,13 @@ module BigramGraph {
     }
   }
 
-  lemma CollapseAllNoBackEdges(g: Graph)
+  lemma CollapseAllNoBackEdges(g: Graph, maxLen: nat)
     requires WF(g)
     requires InteriorNodes(g) != {}
     requires NoBackEdges(g)
-    ensures NoBackEdges(CollapseAllGraph(g))
+    ensures NoBackEdges(CollapseAllGraph(g, maxLen))
   {
-    ContractSCCNoBackEdges(g, InteriorNodes(g));
+    ContractSCCNoBackEdges(g, InteriorNodes(g), maxLen);
   }
 
   // A freshly-introduced merge node is never given a self-loop, regardless of which of
@@ -3503,12 +3706,12 @@ module BigramGraph {
   // OTHER endpoint from the OLD node set, which m (being fresh) can never be a member
   // of, and "untouched" only ever contains OLD edges (which by definition of "old"
   // cannot mention m either).
-  lemma ContractSCCNoSelfLoopOnFreshNode(g: Graph, C: set<int>)
+  lemma ContractSCCNoSelfLoopOnFreshNode(g: Graph, C: set<int>, maxLen: nat)
     requires WF(g)
     requires CanContractSCC(g, C)
-    ensures (FreshNode(g.nodes), FreshNode(g.nodes)) !in ContractSCCGraph(g, C).edges
+    ensures (FreshNode(g.nodes), FreshNode(g.nodes)) !in ContractSCCGraph(g, C, maxLen).edges
   {
-    var g' := ContractSCCGraph(g, C);
+    var g' := ContractSCCGraph(g, C, maxLen);
     var m := FreshNode(g.nodes);
     if (m, m) in g'.edges {
       if m !in C && m !in C {
@@ -3518,12 +3721,12 @@ module BigramGraph {
     }
   }
 
-  lemma CollapseAllNoSelfLoopOnFreshNode(g: Graph)
+  lemma CollapseAllNoSelfLoopOnFreshNode(g: Graph, maxLen: nat)
     requires WF(g)
     requires InteriorNodes(g) != {}
-    ensures (FreshNode(g.nodes), FreshNode(g.nodes)) !in CollapseAllGraph(g).edges
+    ensures (FreshNode(g.nodes), FreshNode(g.nodes)) !in CollapseAllGraph(g, maxLen).edges
   {
-    ContractSCCNoSelfLoopOnFreshNode(g, InteriorNodes(g));
+    ContractSCCNoSelfLoopOnFreshNode(g, InteriorNodes(g), maxLen);
   }
 
   // ---- Small set-cardinality helpers, used below to justify the loop's termination ----
@@ -3630,14 +3833,14 @@ module BigramGraph {
     CardEdgesRemoveNonempty(g.edges, bypass);
   }
 
-  lemma InteriorNodesCollapseAll(g: Graph)
+  lemma InteriorNodesCollapseAll(g: Graph, maxLen: nat)
     requires WF(g)
     requires InteriorNodes(g) != {}
-    ensures InteriorNodes(CollapseAllGraph(g)) == {FreshNode(g.nodes)}
-    ensures |InteriorNodes(CollapseAllGraph(g))| == 1
+    ensures InteriorNodes(CollapseAllGraph(g, maxLen)) == {FreshNode(g.nodes)}
+    ensures |InteriorNodes(CollapseAllGraph(g, maxLen))| == 1
   {
     var C := InteriorNodes(g);
-    var g' := ContractSCCGraph(g, C);
+    var g' := ContractSCCGraph(g, C, maxLen);
     var m := FreshNode(g.nodes);
     assert g'.nodes == g.nodes - C + {m};
     assert m != g.start && m != g.end;
@@ -3648,8 +3851,9 @@ module BigramGraph {
 
   // ---- Matches-equivalence infrastructure ----
   //
-  // ContractSCCGraph(g, C)'s label at the merged node is Star(UnionAllLabels(g, cs))
-  // for cs := SetToSeq(C) - a ghost function using `:|` internally, so an executable
+  // ContractSCCGraph(g, C, maxLen)'s label at the merged node is
+  // RepRange(UnionAllLabels(g, cs), 0, maxLen) for cs := SetToSeq(C) - a ghost function
+  // using `:|` internally, so an executable
   // builder cannot reproduce that EXACT sequence (only an arbitrary, but equally valid,
   // enumeration of the same set C). Rather than re-derive the whole SCC
   // soundness/single-occurrence proof for an arbitrary enumeration (duplicating
@@ -3700,19 +3904,31 @@ module BigramGraph {
     }
   }
 
-  lemma MatchesEquivStar(r1: Regex, r2: Regex, s: string)
+  // ROUND 13: replaces MatchesEquivStar (Star-specific, proved by induction on |s|) with
+  // the RepRange analogue this round's contraction now needs - proved by induction on k
+  // instead, mirroring MatchesKCopies's own recursive structure directly.
+  lemma MatchesKCopiesEquiv(r1: Regex, r2: Regex, s: string, k: nat)
     requires forall t :: Matches(r1, t) <==> Matches(r2, t)
-    ensures Matches(Star(r1), s) <==> Matches(Star(r2), s)
-    decreases |s|
+    ensures MatchesKCopies(r1, s, k) <==> MatchesKCopies(r2, s, k)
+    decreases k
   {
-    if s == "" {
+    if k == 0 {
     } else {
-      forall i | 0 < i <= |s|
-        ensures (Matches(r1, s[..i]) && Matches(Star(r1), s[i..])) <==>
-                (Matches(r2, s[..i]) && Matches(Star(r2), s[i..]))
+      forall i | 0 <= i <= |s|
+        ensures (Matches(r1, s[..i]) && MatchesKCopies(r1, s[i..], k - 1)) <==>
+                (Matches(r2, s[..i]) && MatchesKCopies(r2, s[i..], k - 1))
       {
-        MatchesEquivStar(r1, r2, s[i..]);
+        MatchesKCopiesEquiv(r1, r2, s[i..], k - 1);
       }
+    }
+  }
+
+  lemma MatchesEquivRepRange(r1: Regex, r2: Regex, lo: nat, hi: nat, s: string)
+    requires forall t :: Matches(r1, t) <==> Matches(r2, t)
+    ensures Matches(RepRange(r1, lo, hi), s) <==> Matches(RepRange(r2, lo, hi), s)
+  {
+    forall k | lo <= k <= hi ensures MatchesKCopies(r1, s, k) <==> MatchesKCopies(r2, s, k) {
+      MatchesKCopiesEquiv(r1, r2, s, k);
     }
   }
 
@@ -3867,11 +4083,11 @@ module BigramGraph {
     CollapseUntouched(g, C) + CollapseIntoM(g, C, m) + CollapseOutOfM(g, C, m)
   }
 
-  function CollapseLabels(g: Graph, C: set<int>, m: int, cs: seq<int>): map<int, Regex>
+  function CollapseLabels(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat): map<int, Regex>
     requires WF(g)
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
   {
-    (map n | n in g.nodes - C :: n := g.labels[n])[m := Star(UnionAllLabels(g, cs))]
+    (map n | n in g.nodes - C :: n := g.labels[n])[m := RepRange(UnionAllLabels(g, cs), 0, maxLen)]
   }
 
   // ExecCollapseAll's postcondition needs a ghost expression it can name without
@@ -3892,12 +4108,12 @@ module BigramGraph {
     ExecFreshNodeIsFreshNode(nodes, m);
   }
 
-  lemma ExecCollapseAllWF(g: Graph, C: set<int>, m: int, cs: seq<int>, g2: Graph)
+  lemma ExecCollapseAllWF(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat, g2: Graph)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires m !in g.nodes
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
-    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end)
+    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end)
     ensures WF(g2)
   {
     assert g2.labels.Keys == g2.nodes;
@@ -3911,7 +4127,7 @@ module BigramGraph {
     }
   }
 
-  lemma ExecCollapseAllSoreDisjoint(g: Graph, C: set<int>, m: int, cs: seq<int>, g2: Graph)
+  lemma ExecCollapseAllSoreDisjoint(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat, g2: Graph)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
@@ -3920,14 +4136,14 @@ module BigramGraph {
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
     requires forall i, j :: 0 <= i < |cs| && 0 <= j < |cs| && i != j ==> cs[i] != cs[j]
     requires forall x :: x in cs <==> x in C
-    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end)
+    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end)
     ensures WF(g2)
     ensures AllLabelsSore(g2)
     ensures PairwiseDisjointLabels(g2)
   {
-    ExecCollapseAllWF(g, C, m, cs, g2);
+    ExecCollapseAllWF(g, C, m, cs, maxLen, g2);
     UnionAllLabelsIsSore(g, cs);
-    StarIsSore(UnionAllLabels(g, cs));
+    RepRangeIsSore(UnionAllLabels(g, cs), 0, maxLen);
     forall n | n in g2.nodes ensures IsSore(g2.labels[n]) {
     }
     forall n1, n2 | n1 in g2.nodes && n2 in g2.nodes && n1 != n2
@@ -3957,17 +4173,17 @@ module BigramGraph {
     }
   }
 
-  lemma ExecCollapseAllNoBackEdges(g: Graph, C: set<int>, m: int, cs: seq<int>, g2: Graph)
+  lemma ExecCollapseAllNoBackEdges(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat, g2: Graph)
     requires WF(g)
     requires NoBackEdges(g)
     requires CanContractSCC(g, C)
     requires m !in g.nodes
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
-    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end)
+    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end)
     ensures WF(g2)
     ensures NoBackEdges(g2)
   {
-    ExecCollapseAllWF(g, C, m, cs, g2);
+    ExecCollapseAllWF(g, C, m, cs, maxLen, g2);
     forall e | e in g2.edges ensures e.1 != g.start {
       if e.0 != m && e.1 != m {
       } else if e.1 == m {
@@ -3984,18 +4200,18 @@ module BigramGraph {
     }
   }
 
-  lemma ExecCollapseAllInterior(g: Graph, C: set<int>, m: int, cs: seq<int>, g2: Graph)
+  lemma ExecCollapseAllInterior(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat, g2: Graph)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires C == InteriorNodes(g)
     requires m !in g.nodes
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
-    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end)
+    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end)
     ensures WF(g2)
     ensures InteriorNodes(g2) == {m}
     ensures (m, m) !in g2.edges
   {
-    ExecCollapseAllWF(g, C, m, cs, g2);
+    ExecCollapseAllWF(g, C, m, cs, maxLen, g2);
     assert m != g.start && m != g.end;
     assert InteriorNodes(g) - C == {};
     if (m, m) in g2.edges {
@@ -4003,22 +4219,27 @@ module BigramGraph {
     }
   }
 
-  lemma ExecCollapseAllSentinels(g: Graph, C: set<int>, m: int, cs: seq<int>, g2: Graph)
+  lemma ExecCollapseAllSentinels(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat, g2: Graph)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires m !in g.nodes
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
-    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end)
+    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end)
     ensures WF(g2)
     ensures g.start in g2.nodes && g.end in g2.nodes
     ensures g2.labels[g.start] == g.labels[g.start]
     ensures g2.labels[g.end] == g.labels[g.end]
   {
-    ExecCollapseAllWF(g, C, m, cs, g2);
+    ExecCollapseAllWF(g, C, m, cs, maxLen, g2);
     assert g.start !in C && g.end !in C;
   }
 
-  lemma ExecCollapseAllSoundOne(g: Graph, C: set<int>, m: int, cs: seq<int>, g2: Graph, w: string)
+  // ROUND 13: now conditioned on `|w| <= maxLen` (the bounded RepRange, unlike the old
+  // unbounded Star, cannot accept a sample requiring more repetitions than that) - see
+  // this lemma's caller (ExecContractSCC/ExecCollapseAll) for how the driver discharges
+  // this per w in S, mirroring exactly how Round 12's LoopToPlusSound/LoopStepLoopToPlus
+  // conditioned their own acceptance-preservation on `LongestRun(w,c) <= maxRun`.
+  lemma ExecCollapseAllSoundOne(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat, g2: Graph, w: string)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
@@ -4027,35 +4248,36 @@ module BigramGraph {
     requires m == FreshNode(g.nodes)
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
     requires forall x :: x in cs <==> x in C
-    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end)
+    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end)
     requires GraphAccepts(g, w)
+    requires |w| <= maxLen
     ensures WF(g2)
     ensures GraphAccepts(g2, w)
   {
-    ExecCollapseAllWF(g, C, m, cs, g2);
-    ContractSCCSound(g, C, w);
-    var gGhost := ContractSCCGraph(g, C);
+    ExecCollapseAllWF(g, C, m, cs, maxLen, g2);
+    ContractSCCSound(g, C, maxLen, w);
+    var gGhost := ContractSCCGraph(g, C, maxLen);
     var csGhost := SetToSeq(C);
     assert gGhost.nodes == g2.nodes;
     assert gGhost.edges == g2.edges;
     assert gGhost.start == g2.start && gGhost.end == g2.end;
     assert forall n :: n in gGhost.nodes && n != m ==> gGhost.labels[n] == g2.labels[n];
     assert forall s :: Matches(gGhost.labels[m], s) <==> Matches(g2.labels[m], s) by {
-      assert gGhost.labels[m] == Star(UnionAllLabels(g, csGhost));
-      assert g2.labels[m] == Star(UnionAllLabels(g, cs));
-      forall s ensures Matches(Star(UnionAllLabels(g, csGhost)), s) <==> Matches(Star(UnionAllLabels(g, cs)), s) {
+      assert gGhost.labels[m] == RepRange(UnionAllLabels(g, csGhost), 0, maxLen);
+      assert g2.labels[m] == RepRange(UnionAllLabels(g, cs), 0, maxLen);
+      forall s ensures Matches(RepRange(UnionAllLabels(g, csGhost), 0, maxLen), s) <==> Matches(RepRange(UnionAllLabels(g, cs), 0, maxLen), s) {
         assert forall t :: Matches(UnionAllLabels(g, csGhost), t) <==> Matches(UnionAllLabels(g, cs), t) by {
           forall t ensures Matches(UnionAllLabels(g, csGhost), t) <==> Matches(UnionAllLabels(g, cs), t) {
             UnionAllLabelsPermInvariant(g, csGhost, cs, t);
           }
         }
-        MatchesEquivStar(UnionAllLabels(g, csGhost), UnionAllLabels(g, cs), s);
+        MatchesEquivRepRange(UnionAllLabels(g, csGhost), UnionAllLabels(g, cs), 0, maxLen, s);
       }
     }
     GraphAcceptsRelabelEquiv(gGhost, g2, m, w);
   }
 
-  method ExecCollapseAll(g: Graph) returns (g2: Graph)
+  method ExecCollapseAll(g: Graph, maxLen: nat) returns (g2: Graph)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
@@ -4072,7 +4294,7 @@ module BigramGraph {
     ensures g2.end == g.end
     ensures g2.labels[g.start] == g.labels[g.start]
     ensures g2.labels[g.end] == g.labels[g.end]
-    ensures forall w :: GraphAccepts(g, w) ==> GraphAccepts(g2, w)
+    ensures forall w :: GraphAccepts(g, w) && |w| <= maxLen ==> GraphAccepts(g2, w)
   {
     var C := InteriorNodes(g);
     var cs := SetToSeqExec(C);
@@ -4080,14 +4302,14 @@ module BigramGraph {
     ExecFreshNodeIsFreshNode(g.nodes, m);
     ExecFreshNodeGhostValueEq(g.nodes, m);
 
-    g2 := Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end);
+    g2 := Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end);
 
-    ExecCollapseAllSoreDisjoint(g, C, m, cs, g2);
-    ExecCollapseAllNoBackEdges(g, C, m, cs, g2);
-    ExecCollapseAllInterior(g, C, m, cs, g2);
-    ExecCollapseAllSentinels(g, C, m, cs, g2);
-    forall w | GraphAccepts(g, w) ensures GraphAccepts(g2, w) {
-      ExecCollapseAllSoundOne(g, C, m, cs, g2, w);
+    ExecCollapseAllSoreDisjoint(g, C, m, cs, maxLen, g2);
+    ExecCollapseAllNoBackEdges(g, C, m, cs, maxLen, g2);
+    ExecCollapseAllInterior(g, C, m, cs, maxLen, g2);
+    ExecCollapseAllSentinels(g, C, m, cs, maxLen, g2);
+    forall w | GraphAccepts(g, w) && |w| <= maxLen ensures GraphAccepts(g2, w) {
+      ExecCollapseAllSoundOne(g, C, m, cs, maxLen, g2, w);
     }
   }
 
@@ -4546,7 +4768,7 @@ module BigramGraph {
   // above InferViaBigramGraph for what it does and why both canonicalization steps are
   // needed. ----
 
-  method {:timeLimitMultiplier 4} FinishSingleInteriorNode(g0: Graph, S: set<string>, w0: string) returns (r: Regex)
+  method {:timeLimitMultiplier 4} FinishSingleInteriorNode(g0: Graph, S: set<string>, w0: string, maxLen: nat) returns (r: Regex)
     requires WF(g0)
     requires AllLabelsSore(g0)
     requires PairwiseDisjointLabels(g0)
@@ -4554,6 +4776,7 @@ module BigramGraph {
     requires g0.labels[g0.start] == Eps
     requires g0.labels[g0.end] == Eps
     requires forall w :: w in S ==> GraphAccepts(g0, w)
+    requires forall w :: w in S ==> |w| <= maxLen
     requires |InteriorNodes(g0)| == 1
     requires w0 in S && w0 != ""
     ensures forall w :: w in S ==> Matches(r, w)
@@ -4567,7 +4790,13 @@ module BigramGraph {
 
     if (m, m) in g.edges {
       var oldG := g;
-      g := ExecCollapseAll(oldG);
+      g := ExecCollapseAll(oldG, maxLen);
+      assert forall w :: w in S ==> GraphAccepts(g, w) by {
+        forall w | w in S ensures GraphAccepts(g, w) {
+          assert GraphAccepts(oldG, w);
+          assert |w| <= maxLen;
+        }
+      }
       var interior2 := InteriorNodes(g);
       var m2 :| m2 in interior2;
       SingletonSetChar(interior2, m2);
@@ -4780,17 +5009,17 @@ module BigramGraph {
   // ExecCollapseAll (Round 7) from C := InteriorNodes(g) to any C satisfying
   // CanContractSCC(g, C). ----
 
-  lemma ExecContractSCCInterior(g: Graph, C: set<int>, m: int, cs: seq<int>, g2: Graph)
+  lemma ExecContractSCCInterior(g: Graph, C: set<int>, m: int, cs: seq<int>, maxLen: nat, g2: Graph)
     requires WF(g)
     requires CanContractSCC(g, C)
     requires m !in g.nodes
     requires forall i :: 0 <= i < |cs| ==> cs[i] in g.nodes
-    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end)
+    requires g2 == Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end)
     ensures WF(g2)
     ensures InteriorNodes(g2) == InteriorNodes(g) - C + {m}
     ensures |InteriorNodes(g2)| == |InteriorNodes(g)| - |C| + 1
   {
-    ExecCollapseAllWF(g, C, m, cs, g2);
+    ExecCollapseAllWF(g, C, m, cs, maxLen, g2);
     assert g2.nodes == g.nodes - C + {m};
     assert m != g.start && m != g.end;
     assert C <= InteriorNodes(g);
@@ -4800,7 +5029,7 @@ module BigramGraph {
     CardAddOne(InteriorNodes(g) - C, m);
   }
 
-  method ExecContractSCC(g: Graph, C: set<int>) returns (g2: Graph)
+  method ExecContractSCC(g: Graph, C: set<int>, maxLen: nat) returns (g2: Graph)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
@@ -4817,21 +5046,21 @@ module BigramGraph {
     ensures g2.end == g.end
     ensures g2.labels[g.start] == g.labels[g.start]
     ensures g2.labels[g.end] == g.labels[g.end]
-    ensures forall w :: GraphAccepts(g, w) ==> GraphAccepts(g2, w)
+    ensures forall w :: GraphAccepts(g, w) && |w| <= maxLen ==> GraphAccepts(g2, w)
   {
     var cs := SetToSeqExec(C);
     var m := ExecFreshNode(g.nodes);
     ExecFreshNodeIsFreshNode(g.nodes, m);
     ExecFreshNodeGhostValueEq(g.nodes, m);
 
-    g2 := Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs), CollapseEdges(g, C, m), g.start, g.end);
+    g2 := Graph(CollapseNodes(g, C, m), CollapseLabels(g, C, m, cs, maxLen), CollapseEdges(g, C, m), g.start, g.end);
 
-    ExecCollapseAllSoreDisjoint(g, C, m, cs, g2);
-    ExecCollapseAllNoBackEdges(g, C, m, cs, g2);
-    ExecContractSCCInterior(g, C, m, cs, g2);
-    ExecCollapseAllSentinels(g, C, m, cs, g2);
-    forall w | GraphAccepts(g, w) ensures GraphAccepts(g2, w) {
-      ExecCollapseAllSoundOne(g, C, m, cs, g2, w);
+    ExecCollapseAllSoreDisjoint(g, C, m, cs, maxLen, g2);
+    ExecCollapseAllNoBackEdges(g, C, m, cs, maxLen, g2);
+    ExecContractSCCInterior(g, C, m, cs, maxLen, g2);
+    ExecCollapseAllSentinels(g, C, m, cs, maxLen, g2);
+    forall w | GraphAccepts(g, w) && |w| <= maxLen ensures GraphAccepts(g2, w) {
+      ExecCollapseAllSoundOne(g, C, m, cs, maxLen, g2, w);
     }
   }
 
@@ -6385,6 +6614,7 @@ module BigramGraph {
     }
 
     var w0 :| w0 in S && w0 != "";
+    var maxLen := MaxLenOverSet(S);
 
     while |InteriorNodes(g)| >= 2
       invariant WF(g)
@@ -6427,9 +6657,15 @@ module BigramGraph {
                 var oldG := g;
                 assert CanContractSCC(oldG, C) && |C| >= 2;
                 assert C <= InteriorNodes(oldG);
-                g := ExecContractSCC(oldG, C);
+                g := ExecContractSCC(oldG, C, maxLen);
                 assert |InteriorNodes(g)| == |InteriorNodes(oldG)| - |C| + 1;
                 assert |InteriorNodes(g)| < |InteriorNodes(oldG)|;
+                assert forall w :: w in S ==> GraphAccepts(g, w) by {
+                  forall w | w in S ensures GraphAccepts(g, w) {
+                    assert GraphAccepts(oldG, w);
+                    assert |w| <= maxLen;
+                  }
+                }
               } else {
                 var foundTopo, order := TopoSort(g);
                 if foundTopo {
@@ -6449,7 +6685,13 @@ module BigramGraph {
                   // above, but if TopoSort ever can't complete, fall back to the
                   // always-sound (if lossy) wildcard collapse.
                   var oldG := g;
-                  g := ExecCollapseAll(oldG);
+                  g := ExecCollapseAll(oldG, maxLen);
+                  assert forall w :: w in S ==> GraphAccepts(g, w) by {
+                    forall w | w in S ensures GraphAccepts(g, w) {
+                      assert GraphAccepts(oldG, w);
+                      assert |w| <= maxLen;
+                    }
+                  }
                 }
               }
             }
@@ -6458,6 +6700,6 @@ module BigramGraph {
       }
     }
 
-    r := FinishSingleInteriorNode(g, S, w0);
+    r := FinishSingleInteriorNode(g, S, w0, maxLen);
   }
 }

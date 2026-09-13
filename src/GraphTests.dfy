@@ -196,12 +196,77 @@ module GraphTests {
   // after this round it instead produces Concat(Sym(x),Star(Union(Sym(a),Sym(b)))) -
   // i.e. x(a|b)* - which correctly rejects "ax" (and "bx"), a full wildcard's language
   // strictly containing this tighter one's.
+  //
+  // ROUND 13 tightens this further: Star's unbounded "any number of a/b" is replaced with
+  // RepRange(Union(Sym('a'),Sym('b')), 0, maxLen), maxLen := 3 (the longest sample,
+  // "xab"/"xba", both length 3) - so InferViaBigramGraph now produces
+  // Concat(Sym('x'),RepRange(Union(Sym('a'),Sym('b')),0,3)) - i.e. x[ab]{0,3} (confirmed
+  // empirically). This still accepts every sample (each needs only 2 repetitions of the
+  // cycle) but now correctly rejects a probe needing MORE repetitions than any sample
+  // ever showed - "xaaaa" (4 reps, one past the bound) and the two former
+  // over-generalization witnesses below ("xaabb", 4 reps; "xababab", 6 reps), both
+  // WRONGLY accepted under the old unbounded Star and now correctly rejected.
   method {:test} TestNontrivialSCCTightening() {
     var r := CheckOneSet({"xab", "xba"}, "xab/xba nontrivial SCC tightening");
     expect Matches(r, "xab") && Matches(r, "xba");
-    expect Matches(r, "x") && Matches(r, "xaabb") && Matches(r, "xababab");
+    expect Matches(r, "x");
     expect !Matches(r, "ax");
     expect !Matches(r, "bx");
+    // ROUND 13: one more repetition of the cycle than the computed bound (maxLen = 3)
+    // allows - wrongly accepted under the old unbounded Star, correctly rejected now.
+    expect !Matches(r, "xaaaa");
+    expect !Matches(r, "xaabb");
+    expect !Matches(r, "xababab");
+  }
+
+  // ---- ROUND 13 fuzz-style coverage: sweeps several more "shapes" of genuine 2+-node
+  // SCC-contraction (not just self-loops, which Round 12's own fuzz coverage above
+  // already handles) beyond TestNontrivialSCCTightening's one worked example, checking
+  // for each one that (1) every input sample is still accepted and (2) a probe built with
+  // "one more repetition of the cycle than the computed maxLen bound allows" is correctly
+  // REJECTED - confirming the RepRange bound ContractSCCGraph/CollapseAllGraph compute is
+  // genuinely tight to the input set's own longest sample, not merely some bound that
+  // happens to be large enough. Each case was checked empirically (via a scratch probe)
+  // to confirm it actually resolves via genuine SCC-contraction (a real cycle spanning
+  // 2+ nodes) rather than self-loop-to-Plus or CollapseAllGraph's own defensive
+  // fallback. ----
+
+  method CheckSCCBoundTight(S: set<string>, caseName: string, probeAccept: seq<string>, probeReject: seq<string>)
+  {
+    var r := CheckOneSet(S, caseName);
+    var accepted := CheckAllAccepted(r, probeAccept);
+    expect accepted, "fuzz case '" + caseName + "': an expected-accept probe was rejected";
+    var i := 0;
+    while i < |probeReject|
+      invariant 0 <= i <= |probeReject|
+    {
+      expect !Matches(r, probeReject[i]),
+        "fuzz case '" + caseName + "': probe '" + probeReject[i] +
+        "' should have been rejected (one more repetition than the computed bound allows) but was accepted";
+      i := i + 1;
+    }
+  }
+
+  method {:test} TestSCCFuzzGenuineMultiNodeCycles() {
+    // "pcd"/"pdc": a genuine 2-node cycle {c,d} behind a single-symbol anchor 'p' -
+    // maxLen = 3 (both samples have length 3), so the cycle accepts at most 3
+    // repetitions of c/d; one more (4 reps, "pcccc") must be rejected.
+    CheckSCCBoundTight({"pcd", "pdc"}, "fuzz: SCC behind single-symbol anchor, maxLen 3",
+      ["pcd", "pdc", "pccc"], ["pcccc"]);
+    // "wxyzcd"/"wxyzdc": the same 2-node cycle {c,d}, now behind a longer (still
+    // self-loop-free, simple-path-contracted) anchor "wxyz" - maxLen = 6 (both samples
+    // have length 6), a strictly looser bound than case A even though the cycle itself
+    // still only ever needs 2 repetitions - confirming the bound tracks the INPUT SET'S
+    // longest sample (this file's own simplest-safe-choice, matching the wildcard/
+    // self-loop precedent), not some cycle-local minimum; one more than 6 reps ("wxyz" +
+    // 7 c's) must be rejected.
+    CheckSCCBoundTight({"wxyzcd", "wxyzdc"}, "fuzz: SCC behind multi-symbol anchor, maxLen 6",
+      ["wxyzcd", "wxyzdc", "wxyzcccccc"], ["wxyzccccccc"]);
+    // "xabm"/"xbam": a 2-node cycle {a,b} with anchors on BOTH sides ('x' before, 'm'
+    // after) - maxLen = 4 (both samples have length 4); one more than 4 reps of a/b
+    // ("xaaaaam", 5 reps) must be rejected.
+    CheckSCCBoundTight({"xabm", "xbam"}, "fuzz: SCC with anchors on both sides, maxLen 4",
+      ["xabm", "xbam", "xaaaam"], ["xaaaaam"]);
   }
 
   // Distinguishes Graph.dfy's Round 9 (self-loop-to-Plus contraction) from the behavior
