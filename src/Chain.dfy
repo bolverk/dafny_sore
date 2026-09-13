@@ -2,6 +2,55 @@
 // string "fits" that order (i.e. is a concatenation of maximal runs of each symbol,
 // in that order, some runs possibly empty via the surrounding Opt), and build the
 // corresponding single-occurrence regex.
+//
+// ---- Per-position tight bound (this round) ----
+//
+// The base chain construction (ConcatAllBounded, for orders the Slot refinement's own
+// CheckSlotsAll doesn't accept) and the Slot machinery's SSingle "rep" case (BuildSlotsAt,
+// SlotRegex) used to wrap every repeated position UNCONDITIONALLY in Opt(Plus(Sym(c)))/
+// Plus(Sym(c)) - "any number of repetitions, including none" - regardless of how many
+// times any actual input sample ever repeated that character at that position. Both are
+// now bounded per-position with RepRange(Sym(c), lo, maxRunHere): lo is 0 (ConcatAllBounded)
+// or 0/1 (Slot, folding "mandatory" directly into RepRange's lower bound instead of a
+// separate Opt wrapper), and maxRunHere := MaxRunHere(strs, c) is the largest run of c
+// actually observed at the front of any sample in the batch, ONCE THAT SAMPLE HAS BEEN
+// STRIPPED of everything earlier positions/slots already consumed - i.e. exactly the
+// RunLength(_, c) value Fits/FitsSlots already compute at that recursion depth, maxed
+// over the batch (StripRunChars carries each sample's own stripped remainder down the
+// recursion in lockstep with the order/slots, mirroring BuildSlotsAt's/Fits's own
+// structure - see MaxRunHere/StripRunCharsMem below). This is a genuinely PER-POSITION
+// bound, not one shared constant: e.g. for {"aabbc", "abbbc"}, 'a' gets bound 2 (from
+// "aabbc"'s "aa") and 'b' gets bound 3 (from "abbbc"'s "bbb") - a{1,2}b{1,3}c - since the
+// two positions' tightest bounds are independent of each other, unlike tier 2/3's single
+// shared maxK/maxLen (those repeat one whole sub-expression as a unit, so one shared bound
+// suffices there; here each position repeats a different single character, so each needs
+// its own).
+//
+// Soundness bridges through the same MatchesKCopies/MatchesKCopiesImpliesRepRange
+// machinery (Regex.dfy) tiers 2/3 already used, specialized to a single repeated
+// character via SymKCopies (a k-copies analogue of OptPlusSymMatchesRepeat/
+// PlusSymMatchesRepeat, mirroring UnionKCopies's role for tier 3): a fitting t's run of m
+// copies of c is exactly MatchesKCopies(Sym(c), Repeat(c,m), m), and m <= maxRunHere
+// follows from MaxRunHereBound applied to t (which requires t be an actual member of the
+// stripped-down batch at that position - tracked through the recursion via
+// StripRunCharsMem). Because the bound now lives inside the constructed Slot value itself
+// (Slot's new `maxRun` field) rather than being reconstructed generically from `slots`
+// alone, FitsSlotsSound was changed to take (order, strs) directly and walk them in
+// lockstep with BuildSlotsAt's own recursion (mirroring BuildSlotsAtSymbols's existing
+// control flow) instead of a bare `slots` list, so it can re-derive at each position which
+// batch (after stripping) the bound was computed from.
+//
+// Concrete before/after (via `python3 ./sore.py <inputs>`, after
+// `dafny build --target:py src/Regex.dfy src/Chain.dfy src/Infer.dfy src/Print.dfy
+// src/Main.dfy --output build/sore`):
+//   sore.py aabbc abbbc  ->  before: a+b+c        after: a{1,2}b{1,3}c
+//   sore.py aab          ->  before: a+b          after: a{1,2}b
+//
+// No new proof-tractability issues were hit: the per-position recursion mirrors
+// FitsSound/FitsSlotsSound's/BuildSlotsAtSymbols's existing structure almost exactly, just
+// threading `strs` through in lockstep (via StripRunChars, already used by BuildSlotsAt
+// itself) so MaxRunHereBound can be applied to the right stripped-down sample at each
+// position.
 include "Regex.dfy"
 
 module Chain {
@@ -103,6 +152,30 @@ module Chain {
     }
   }
 
+  // A single character's repeated-k-times string decomposes into exactly k concatenated
+  // one-character copies of Sym(c) - the bridge to RepRange (via
+  // MatchesKCopiesImpliesRepRange in Regex.dfy) for the plain per-position bound
+  // (ConcatAllBounded/FitsSoundBounded and the Slot machinery's SSingle rep case below),
+  // exactly mirroring UnionKCopies's role for tier 3's wildcard fallback.
+  lemma SymKCopies(c: char, k: nat)
+    ensures MatchesKCopies(Sym(c), Repeat(c, k), k)
+    decreases k
+  {
+    if k == 0 {
+    } else {
+      var s := Repeat(c, k);
+      assert s == [c] + Repeat(c, k - 1);
+      assert s[..1] == [c];
+      assert s[1..] == Repeat(c, k - 1);
+      assert Matches(Sym(c), s[..1]);
+      SymKCopies(c, k - 1);
+      assert MatchesKCopies(Sym(c), s[1..], k - 1);
+      assert MatchesKCopies(Sym(c), s, k) by {
+        assert 0 <= 1 <= |s| && Matches(Sym(c), s[..1]) && MatchesKCopies(Sym(c), s[1..], k - 1);
+      }
+    }
+  }
+
   // A string t "fits" an order of (distinct) symbols if it is exactly the
   // concatenation, in that order, of a (possibly empty) run of each symbol.
   function Fits(t: string, order: seq<char>): bool
@@ -127,20 +200,39 @@ module Chain {
     }
   }
 
-  // The single-occurrence regex Opt(c1+) Opt(c2+) ... Opt(cn+) for order = [c1,...,cn].
-  function ConcatAll(order: seq<char>): Regex
+  // ---- No-duplicate order builds a single-occurrence regex ----
+
+  function NoDup(order: seq<char>): bool {
+    forall i, j :: 0 <= i < |order| && 0 <= j < |order| && i != j ==> order[i] != order[j]
+  }
+
+  // The single-occurrence regex RepRange(c1,0,r1) RepRange(c2,0,r2) ... RepRange(cn,0,rn)
+  // for order = [c1,...,cn], where each ri is the tightest bound the batch `strs` actually
+  // needs at that position: the largest run of ci that appears at the front of any sample
+  // once everything before position i has been stripped off (MaxRunHere, folded over
+  // `strs` as it gets stripped down in lockstep - see StripRunChars/StripRunCharsMem).
+  // Replaces the old, unconditionally-unbounded ConcatAll's Opt(Plus(Sym(order[0])));
+  // RepRange(Sym(c),0,r) is chosen over Opt(RepRange(Sym(c),1,r)) since a single RepRange
+  // already covers both "c doesn't appear" (k=0) and "c appears 1..r times", with one
+  // fewer wrapper to carry through the proofs below.
+  function ConcatAllBounded(order: seq<char>, strs: seq<string>): Regex
     decreases order
   {
     if order == [] then Eps
-    else Concat(Opt(Plus(Sym(order[0]))), ConcatAll(order[1..]))
+    else
+      var c := order[0];
+      var maxRun := MaxRunHere(strs, c);
+      Concat(RepRange(Sym(c), 0, maxRun), ConcatAllBounded(order[1..], StripRunChars(strs, [c])))
   }
 
-  // Soundness of the chain construction: fitting an order is enough to be matched by
-  // the regex built from that order. This lemma is entirely self-contained - it makes
-  // no assumption about how `order` was produced.
-  lemma FitsSound(t: string, order: seq<char>)
+  // Soundness of the bounded chain construction, for any t that's actually a member of
+  // the same batch `strs` the bound was computed from (an arbitrary t merely fitting
+  // `order` is not enough - unlike the old unbounded ConcatAll/FitsSound, the bound here
+  // is only guaranteed to cover runs actually observed in strs).
+  lemma FitsSoundBounded(t: string, order: seq<char>, strs: seq<string>)
     requires Fits(t, order)
-    ensures Matches(ConcatAll(order), t)
+    requires t in strs
+    ensures Matches(ConcatAllBounded(order, strs), t)
     decreases order
   {
     if order == [] {
@@ -150,39 +242,47 @@ module Chain {
       var m := RunLength(t, c);
       RunLengthSplit(t, c);
       assert m <= |t| && t[..m] == Repeat(c, m);
-      OptPlusSymMatchesRepeat(c, m);
-      assert Matches(Opt(Plus(Sym(c))), t[..m]);
-      FitsSound(t[m..], order[1..]);
-      assert Matches(ConcatAll(order[1..]), t[m..]);
-      assert Matches(ConcatAll(order), t) by {
-        assert 0 <= m <= |t| && Matches(Opt(Plus(Sym(c))), t[..m]) && Matches(ConcatAll(order[1..]), t[m..]);
+
+      var maxRun := MaxRunHere(strs, c);
+      MaxRunHereBound(strs, c, t);
+      SymKCopies(c, m);
+      MatchesKCopiesImpliesRepRange(Sym(c), 0, maxRun, m, t[..m]);
+      assert Matches(RepRange(Sym(c), 0, maxRun), t[..m]);
+
+      var strs' := StripRunChars(strs, [c]);
+      StripRunCharsMem(strs, [c], t);
+      StripOneSlotIsRunLength(t, c);
+      assert t[m..] in strs';
+
+      FitsSoundBounded(t[m..], order[1..], strs');
+      assert Matches(ConcatAllBounded(order[1..], strs'), t[m..]);
+      assert Matches(ConcatAllBounded(order, strs), t) by {
+        assert 0 <= m <= |t| &&
+          Matches(RepRange(Sym(c), 0, maxRun), t[..m]) &&
+          Matches(ConcatAllBounded(order[1..], strs'), t[m..]);
       }
     }
   }
 
-  // ---- No-duplicate order builds a single-occurrence regex ----
-
-  function NoDup(order: seq<char>): bool {
-    forall i, j :: 0 <= i < |order| && 0 <= j < |order| && i != j ==> order[i] != order[j]
-  }
-
-  lemma ConcatAllSymbols(order: seq<char>)
-    ensures Symbols(ConcatAll(order)) == multiset(order)
+  lemma ConcatAllBoundedSymbols(order: seq<char>, strs: seq<string>)
+    ensures Symbols(ConcatAllBounded(order, strs)) == multiset(order)
     decreases order
   {
     if order == [] {
       assert order == [];
       assert multiset(order) == multiset{};
     } else {
-      ConcatAllSymbols(order[1..]);
-      assert order == [order[0]] + order[1..];
-      assert multiset(order) == multiset{order[0]} + multiset(order[1..]);
-      assert ConcatAll(order) == Concat(Opt(Plus(Sym(order[0]))), ConcatAll(order[1..]));
-      assert Symbols(ConcatAll(order)) ==
-        Symbols(Opt(Plus(Sym(order[0])))) + Symbols(ConcatAll(order[1..]));
-      assert Symbols(Opt(Plus(Sym(order[0])))) == Symbols(Plus(Sym(order[0])));
-      assert Symbols(Plus(Sym(order[0]))) == Symbols(Sym(order[0]));
-      assert Symbols(Sym(order[0])) == multiset{order[0]};
+      var c := order[0];
+      ConcatAllBoundedSymbols(order[1..], StripRunChars(strs, [c]));
+      assert order == [c] + order[1..];
+      assert multiset(order) == multiset{c} + multiset(order[1..]);
+      var maxRun := MaxRunHere(strs, c);
+      assert ConcatAllBounded(order, strs) ==
+        Concat(RepRange(Sym(c), 0, maxRun), ConcatAllBounded(order[1..], StripRunChars(strs, [c])));
+      assert Symbols(ConcatAllBounded(order, strs)) ==
+        Symbols(RepRange(Sym(c), 0, maxRun)) + Symbols(ConcatAllBounded(order[1..], StripRunChars(strs, [c])));
+      assert Symbols(RepRange(Sym(c), 0, maxRun)) == Symbols(Sym(c));
+      assert Symbols(Sym(c)) == multiset{c};
     }
   }
 
@@ -213,11 +313,11 @@ module Chain {
     }
   }
 
-  lemma NoDupImpliesSore(order: seq<char>)
+  lemma NoDupImpliesSoreBounded(order: seq<char>, strs: seq<string>)
     requires NoDup(order)
-    ensures IsSore(ConcatAll(order))
+    ensures IsSore(ConcatAllBounded(order, strs))
   {
-    ConcatAllSymbols(order);
+    ConcatAllBoundedSymbols(order, strs);
     NoDupMultisetBound(order);
   }
 
@@ -679,6 +779,33 @@ module Chain {
     }
   }
 
+  // ---- Per-position tight bound for the "plain chain" machinery (ConcatAllBounded and
+  // the Slot machinery's SSingle rep case, below): the largest run of a single character c
+  // actually observed at the front of any sample in a batch. Same max-fold shape as
+  // MaxKForPeriod/MaxLen above, just keyed on one character instead of a period/whole
+  // sample. ----
+
+  function MaxRunHere(strs: seq<string>, c: char): nat
+    decreases strs
+  {
+    if strs == [] then 0
+    else
+      var restMax := MaxRunHere(strs[1..], c);
+      var m0 := RunLength(strs[0], c);
+      if m0 > restMax then m0 else restMax
+  }
+
+  lemma MaxRunHereBound(strs: seq<string>, c: char, t: string)
+    requires t in strs
+    ensures RunLength(t, c) <= MaxRunHere(strs, c)
+    decreases strs
+  {
+    if strs[0] == t {
+    } else {
+      MaxRunHereBound(strs[1..], c, t);
+    }
+  }
+
   // ---- Choice/mandatory-refined chain (Slot machinery): a tighter alternative to
   // ConcatAll, applied per-position along an already-validated `order`. Where ConcatAll
   // treats every position as an independently optional/repeatable symbol, Slots capture
@@ -692,15 +819,23 @@ module Chain {
   // every sample (see CheckSlotsAll in Infer.dfy), exactly the certifying-algorithm
   // pattern used everywhere else in this project. ----
 
+  // maxRun is only meaningful when rep is true: the tightest upper bound (from
+  // MaxRunHere over the batch BuildSlotsAt built this slot from) on how many times c can
+  // repeat at this position - see SlotRegex's rep case and BuildSlotsAt below. It's
+  // unused (set to an arbitrary 0) whenever rep is false, since FitsSlots already forces
+  // a non-rep run to have length <= 1 with no bound needed.
   datatype Slot =
-    | SSingle(c: char, mandatory: bool, rep: bool)
+    | SSingle(c: char, mandatory: bool, rep: bool, maxRun: nat)
     | SChoice(cs: seq<char>, mandatory: bool)
 
   function SlotRegex(slot: Slot): Regex {
     match slot
-    case SSingle(c, mandatory, rep) =>
-      var base := if rep then Plus(Sym(c)) else Sym(c);
-      if mandatory then base else Opt(base)
+    case SSingle(c, mandatory, rep, maxRun) =>
+      // rep: bounded by the batch-tight maxRun, with mandatory folded directly into
+      // RepRange's lower bound (0 or 1) rather than a separate Opt wrapper - replaces the
+      // old unbounded Plus/Opt(Plus(Sym(c))).
+      if rep then RepRange(Sym(c), (if mandatory then 1 else 0), maxRun)
+      else if mandatory then Sym(c) else Opt(Sym(c))
     case SChoice(cs, mandatory) =>
       var base := UnionAll(cs);
       if mandatory then base else Opt(base)
@@ -725,7 +860,7 @@ module Chain {
     if slots == [] then t == ""
     else
       match slots[0]
-      case SSingle(c, mandatory, rep) =>
+      case SSingle(c, mandatory, rep, _) =>
         var m := RunLength(t, c);
         assert m <= |t| by { RunLengthBound(t, c); }
         (!mandatory || m > 0) && (rep || m <= 1) && FitsSlots(t[m..], slots[1..])
@@ -736,75 +871,125 @@ module Chain {
           !mandatory && FitsSlots(t, slots[1..])
   }
 
-  lemma FitsSlotsSound(t: string, slots: seq<Slot>)
-    requires FitsSlots(t, slots)
-    ensures Matches(SlotsRegex(slots), t)
-    decreases slots
+  // Soundness of the (bounded) Slot construction, for t a member of the same batch
+  // `strs` that BuildSlotsAt(order, strs) was itself built from - the SSingle rep case's
+  // maxRun bound is only guaranteed to cover runs actually observed in strs (mirrors
+  // FitsSoundBounded's same requirement, for the same reason). Walks order/strs in
+  // lockstep with BuildSlotsAt's own recursion (matching BuildSlotsAtSymbols's control
+  // flow above) so that at each position the slot just built is provably the one
+  // FitsSlots(t, ...) is itself matching against.
+  lemma FitsSlotsSound(t: string, order: seq<char>, strs: seq<string>)
+    requires FitsSlots(t, BuildSlotsAt(order, strs))
+    requires t in strs
+    ensures Matches(SlotsRegex(BuildSlotsAt(order, strs)), t)
+    decreases order
   {
-    if slots == [] {
+    if order == [] {
       assert t == "";
+    } else if CharRepeatsAnywhere(strs, order[0]) {
+      var c := order[0];
+      var mandatory := AllMandatorySingle(strs, c);
+      var maxRun := MaxRunHere(strs, c);
+      var strs' := StripRunChars(strs, [c]);
+      var m := RunLength(t, c);
+      RunLengthSplit(t, c);
+      assert m <= |t| && t[..m] == Repeat(c, m);
+      assert (!mandatory || m > 0);
+      assert FitsSlots(t[m..], BuildSlotsAt(order[1..], strs'));
+
+      MaxRunHereBound(strs, c, t);
+      var lo := if mandatory then 1 else 0;
+      SymKCopies(c, m);
+      MatchesKCopiesImpliesRepRange(Sym(c), lo, maxRun, m, t[..m]);
+      assert Matches(RepRange(Sym(c), lo, maxRun), t[..m]);
+
+      StripRunCharsMem(strs, [c], t);
+      StripOneSlotIsRunLength(t, c);
+      assert t[m..] in strs';
+
+      FitsSlotsSound(t[m..], order[1..], strs');
+      assert Matches(SlotsRegex(BuildSlotsAt(order[1..], strs')), t[m..]);
+
+      assert Matches(SlotsRegex(BuildSlotsAt(order, strs)), t) by {
+        assert 0 <= m <= |t| &&
+          Matches(SlotRegex(SSingle(c, mandatory, true, maxRun)), t[..m]) &&
+          Matches(SlotsRegex(BuildSlotsAt(order[1..], strs')), t[m..]);
+      }
     } else {
-      match slots[0]
-      case SSingle(c, mandatory, rep) => {
+      ExtendNonRepeatingRunBounds(order, strs, []);
+      CoOccursWithAnyEmpty(strs, order[0]);
+      ExtendNonRepeatingRunPositive(order, strs, []);
+      var runLen := ExtendNonRepeatingRun(order, strs, []);
+      var runChars := order[..runLen];
+      var strs' := StripRunChars(strs, runChars);
+
+      if runLen == 1 {
+        var c := order[0];
+        var mandatory := AllMandatorySingle(strs, c);
         var m := RunLength(t, c);
         RunLengthSplit(t, c);
         assert m <= |t| && t[..m] == Repeat(c, m);
-        FitsSlotsSound(t[m..], slots[1..]);
-        assert Matches(SlotsRegex(slots[1..]), t[m..]);
-        if rep {
-          if mandatory {
-            assert m > 0;
-            PlusSymMatchesRepeat(c, m);
-            assert Matches(Plus(Sym(c)), t[..m]);
-          } else {
-            OptPlusSymMatchesRepeat(c, m);
-            assert Matches(Opt(Plus(Sym(c))), t[..m]);
-          }
+        assert runChars == [c];
+        assert m <= 1;
+
+        StripRunCharsMem(strs, runChars, t);
+        StripOneSlotIsRunLength(t, c);
+        assert t[m..] in strs';
+
+        FitsSlotsSound(t[m..], order[1..], strs');
+        assert Matches(SlotsRegex(BuildSlotsAt(order[1..], strs')), t[m..]);
+        if mandatory {
+          assert m == 1;
+          assert t[..1] == [c];
+          assert Matches(Sym(c), t[..m]);
+        } else if m == 0 {
+          OptSoundEps(Sym(c));
+          assert Matches(Opt(Sym(c)), t[..m]);
         } else {
-          assert m <= 1;
-          if mandatory {
-            assert m == 1;
-            assert t[..1] == [c];
-            assert Matches(Sym(c), t[..m]);
-          } else if m == 0 {
-            OptSoundEps(Sym(c));
-            assert Matches(Opt(Sym(c)), t[..m]);
-          } else {
-            assert m == 1;
-            assert t[..1] == [c];
-            OptSound(Sym(c), t[..m]);
-          }
+          assert m == 1;
+          assert t[..1] == [c];
+          OptSound(Sym(c), t[..m]);
         }
-        assert Matches(SlotsRegex(slots), t) by {
+        assert Matches(SlotsRegex(BuildSlotsAt(order, strs)), t) by {
           assert 0 <= m <= |t| &&
-            Matches(SlotRegex(slots[0]), t[..m]) &&
-            Matches(SlotsRegex(slots[1..]), t[m..]);
+            Matches(SlotRegex(SSingle(c, mandatory, false, 0)), t[..m]) &&
+            Matches(SlotsRegex(BuildSlotsAt(order[1..], strs')), t[m..]);
         }
-      }
-      case SChoice(cs, mandatory) => {
-        if t != "" && t[0] in cs {
-          FitsSlotsSound(t[1..], slots[1..]);
-          assert Matches(SlotsRegex(slots[1..]), t[1..]);
-          UnionAllSound(cs, t[0]);
+      } else {
+        var mandatory := AllMandatoryChoice(strs, runChars);
+        if t != "" && t[0] in runChars {
+          assert RunLength(t, t[0]) <= 1;
+          RunLengthBound(t, t[0]);
+          assert RunLength(t, t[0]) >= 1;
+          assert RunLength(t, t[0]) == 1;
+          assert StripOneSlot(t, runChars) == t[RunLength(t, t[0])..];
+          assert t[1..] in strs' by { StripRunCharsMem(strs, runChars, t); }
+
+          FitsSlotsSound(t[1..], order[runLen..], strs');
+          assert Matches(SlotsRegex(BuildSlotsAt(order[runLen..], strs')), t[1..]);
+          UnionAllSound(runChars, t[0]);
           assert t[..1] == [t[0]];
-          assert Matches(UnionAll(cs), t[..1]);
+          assert Matches(UnionAll(runChars), t[..1]);
           if !mandatory {
-            OptSound(UnionAll(cs), t[..1]);
+            OptSound(UnionAll(runChars), t[..1]);
           }
-          assert Matches(SlotsRegex(slots), t) by {
+          assert Matches(SlotsRegex(BuildSlotsAt(order, strs)), t) by {
             assert 0 <= 1 <= |t| &&
-              Matches(SlotRegex(slots[0]), t[..1]) &&
-              Matches(SlotsRegex(slots[1..]), t[1..]);
+              Matches(SlotRegex(SChoice(runChars, mandatory)), t[..1]) &&
+              Matches(SlotsRegex(BuildSlotsAt(order[runLen..], strs')), t[1..]);
           }
         } else {
-          FitsSlotsSound(t, slots[1..]);
-          assert Matches(SlotsRegex(slots[1..]), t[0..]);
-          OptSoundEps(UnionAll(cs));
-          assert Matches(SlotRegex(slots[0]), "");
-          assert Matches(SlotsRegex(slots), t) by {
+          assert StripOneSlot(t, runChars) == t;
+          assert t in strs' by { StripRunCharsMem(strs, runChars, t); }
+
+          FitsSlotsSound(t, order[runLen..], strs');
+          assert Matches(SlotsRegex(BuildSlotsAt(order[runLen..], strs')), t[0..]);
+          OptSoundEps(UnionAll(runChars));
+          assert Matches(SlotRegex(SChoice(runChars, mandatory)), "");
+          assert Matches(SlotsRegex(BuildSlotsAt(order, strs)), t) by {
             assert 0 <= 0 <= |t| &&
-              Matches(SlotRegex(slots[0]), t[..0]) &&
-              Matches(SlotsRegex(slots[1..]), t[0..]);
+              Matches(SlotRegex(SChoice(runChars, mandatory)), t[..0]) &&
+              Matches(SlotsRegex(BuildSlotsAt(order[runLen..], strs')), t[0..]);
           }
         }
       }
@@ -813,7 +998,7 @@ module Chain {
 
   function SlotSymbols(slot: Slot): multiset<char> {
     match slot
-    case SSingle(c, _, _) => multiset{c}
+    case SSingle(c, _, _, _) => multiset{c}
     case SChoice(cs, _) => multiset(cs)
   }
 
@@ -827,11 +1012,19 @@ module Chain {
     ensures Symbols(SlotRegex(slot)) == SlotSymbols(slot)
   {
     match slot
-    case SSingle(c, mandatory, rep) => {
-      var base := if rep then Plus(Sym(c)) else Sym(c);
-      assert SlotRegex(slot) == (if mandatory then base else Opt(base));
-      assert Symbols(base) == multiset{c};
-      assert Symbols(Opt(base)) == Symbols(base);
+    case SSingle(c, mandatory, rep, maxRun) => {
+      if rep {
+        assert SlotRegex(slot) == RepRange(Sym(c), (if mandatory then 1 else 0), maxRun);
+        assert Symbols(RepRange(Sym(c), (if mandatory then 1 else 0), maxRun)) == Symbols(Sym(c));
+        assert Symbols(Sym(c)) == multiset{c};
+      } else if mandatory {
+        assert SlotRegex(slot) == Sym(c);
+        assert Symbols(Sym(c)) == multiset{c};
+      } else {
+        assert SlotRegex(slot) == Opt(Sym(c));
+        assert Symbols(Opt(Sym(c))) == Symbols(Sym(c));
+        assert Symbols(Sym(c)) == multiset{c};
+      }
     }
     case SChoice(cs, mandatory) => {
       UnionAllSymbolsMultiset(cs);
@@ -921,6 +1114,30 @@ module Chain {
     if strs == [] then [] else [StripOneSlot(strs[0], cs)] + StripRunChars(strs[1..], cs)
   }
 
+  // Membership is preserved through StripRunChars: if t is one of the batch, its own
+  // stripped remainder is one of the stripped batch's. Needed (by FitsSoundBounded and
+  // FitsSlotsSound below) to carry the "t in strs" fact down through the recursive
+  // strip, so MaxRunHereBound can still be applied at each deeper position.
+  lemma StripRunCharsMem(strs: seq<string>, cs: seq<char>, t: string)
+    requires t in strs
+    ensures StripOneSlot(t, cs) in StripRunChars(strs, cs)
+    decreases strs
+  {
+    if strs[0] == t {
+    } else {
+      StripRunCharsMem(strs[1..], cs, t);
+    }
+  }
+
+  // For a single-character strip (cs == [c]), StripOneSlot agrees exactly with peeling
+  // off RunLength(t, c) characters - the same remainder ConcatAllBounded/FitsSoundBounded
+  // and BuildSlotsAt's SSingle rep case recurse into.
+  lemma StripOneSlotIsRunLength(t: string, c: char)
+    ensures var m := RunLength(t, c); m <= |t| && StripOneSlot(t, [c]) == t[m..]
+  {
+    RunLengthBound(t, c);
+  }
+
   // How many leading elements of `order` form a maximal run of characters that never
   // repeat and are pairwise mutually exclusive across every sample (never co-occur) - a
   // candidate for merging into one SChoice. `runSoFar` accumulates the characters
@@ -971,7 +1188,8 @@ module Chain {
   {
     if order == [] then []
     else if CharRepeatsAnywhere(strs, order[0]) then
-      var slot := SSingle(order[0], AllMandatorySingle(strs, order[0]), true);
+      var maxRun := MaxRunHere(strs, order[0]);
+      var slot := SSingle(order[0], AllMandatorySingle(strs, order[0]), true, maxRun);
       var strs' := StripRunChars(strs, [order[0]]);
       [slot] + BuildSlotsAt(order[1..], strs')
     else
@@ -983,7 +1201,7 @@ module Chain {
       }
       var runChars := order[..runLen];
       var slot :=
-        if runLen == 1 then SSingle(order[0], AllMandatorySingle(strs, order[0]), false)
+        if runLen == 1 then SSingle(order[0], AllMandatorySingle(strs, order[0]), false, 0)
         else SChoice(runChars, AllMandatoryChoice(strs, runChars));
       var strs' := StripRunChars(strs, runChars);
       [slot] + BuildSlotsAt(order[runLen..], strs')

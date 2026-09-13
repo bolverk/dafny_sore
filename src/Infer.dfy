@@ -6,12 +6,18 @@
 // build the chain regex from it (proved sound and single-occurrence via Chain.dfy). If
 // the checker rejects the candidate, we fall through tier 2 (a periodic block, see
 // InferGroupFallbackCore below) and finally tier 3 (the trivial but always sound and
-// always single-occurrence union-of-symbols regex over the sample alphabet). Both of
-// those last two tiers repeat their own sub-expression a TIGHTLY BOUNDED number of times
-// (RepRange(_, lo, hi), Regex.dfy) rather than unboundedly (the old Plus/Star): the
-// bound (maxK for tier 2, maxLen for tier 3) is computed per call from the actual sample
-// batch being handled, as the most repetitions any single sample in that batch actually
-// needs - never a universal constant, and never looser than that observed maximum.
+// always single-occurrence union-of-symbols regex over the sample alphabet). Every tier
+// - including tier 1's own base chain/Slot machinery, not just tiers 2 and 3 - repeats
+// its repeated sub-expressions a TIGHTLY BOUNDED number of times (RepRange(_, lo, hi),
+// Regex.dfy) rather than unboundedly (the old Plus/Star): each bound (maxK for tier 2,
+// maxLen for tier 3, maxRun-per-position - MaxRunHere in Chain.dfy - for tier 1's plain
+// ConcatAllBounded/Slot-rep positions) is computed per call from the actual sample batch
+// being handled, as the most repetitions any single sample in that batch actually needs
+// at that position - never a universal constant, and never looser than that observed
+// maximum. Tier 1's bound is PER POSITION rather than one shared bound across the whole
+// order/slot list, since different symbols at different positions can need different
+// counts (e.g. "aabbc"/"abbbc" -> a{1,2}b{1,3}c: 'a' and 'b' each get their own tightest
+// bound, independent of each other).
 //
 // Infer is a `method`, not a `function`: converting the input `set<string>` into some
 // concrete enumeration order requires an assign-such-that (`x :| x in rem`) pick, and
@@ -2099,9 +2105,12 @@ module SoreInfer {
 
       // Tier-1 refinement: try the tighter mandatory/repeat/choice-slot construction
       // first (e.g. "abc"/"adc" -> a(?:b|d)c instead of a?b?d?c?); fall back to the
-      // already-proven plain ConcatAll(order) if its own independent check fails. The
-      // refinement carries no correctness burden of its own beyond CheckSlotsAll
-      // passing - same certifying-algorithm pattern as everywhere else in this file.
+      // already-proven plain ConcatAllBounded(order, strs) if its own independent check
+      // fails. The refinement carries no correctness burden of its own beyond
+      // CheckSlotsAll passing - same certifying-algorithm pattern as everywhere else in
+      // this file. Both branches bound every plain/slot repeated position by the
+      // tightest count actually observed in strs at that position (MaxRunHere, via
+      // RepRange) rather than the old unbounded Plus/Opt(Plus(_)).
       var slots := BuildSlots(order, strs);
       if CheckSlotsAll(strs, slots) {
         r := SlotsRegex(slots);
@@ -2113,7 +2122,7 @@ module SoreInfer {
 
         forall t | t in strs ensures Matches(r, t) {
           CheckSlotsAllSound(strs, slots, t);
-          FitsSlotsSound(t, slots);
+          FitsSlotsSound(t, order, strs);
         }
 
         forall c | c in Symbols(r) ensures c in AlphabetAll(strs) {
@@ -2122,15 +2131,15 @@ module SoreInfer {
           StringAlphabetMem(order, c);
         }
       } else {
-        r := ConcatAll(order);
-        NoDupImpliesSore(order);
+        r := ConcatAllBounded(order, strs);
+        NoDupImpliesSoreBounded(order, strs);
 
         forall t | t in strs ensures Matches(r, t) {
           CheckOrderAllSound(strs, order, t);
-          FitsSound(t, order);
+          FitsSoundBounded(t, order, strs);
         }
 
-        ConcatAllSymbols(order);
+        ConcatAllBoundedSymbols(order, strs);
         forall c | c in Symbols(r) ensures c in AlphabetAll(strs) {
           assert c in multiset(order);
           assert c in order;

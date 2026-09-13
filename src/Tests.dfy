@@ -201,14 +201,14 @@ module Tests {
   method {:test} TestConsecutiveRepeatGetsTightChain() {
     // "aab" has 'a' repeating, but consecutively (one run of "aa" then "b") - so it was
     // always tier-1-chain-compatible (order=[a,b]), never actually needing tier 2 or the
-    // wildcard. Before the mandatory/repeat Slot refinement, tier 1's plain
-    // ConcatAll(order) treated both positions as independently optional-and-repeatable,
-    // so it also (loosely) accepted "aabb". With the refinement, tier 1 now detects that
-    // 'a' repeats but 'b' never does in this one sample, producing the tighter a+b (one
-    // or more a's, then exactly one b) - so "aabb" is now correctly rejected.
+    // wildcard. The Slot refinement detects that 'a' repeats but 'b' never does in this
+    // one sample, producing a{1,2}b - 'a' bounded by the tightest run actually observed
+    // (maxRun=2, from "aab"'s own "aa"), not the old unbounded a+ - so "aabb" (a repeated
+    // trailing b) is rejected, and so is a 3rd 'a' (past the tight bound).
     CheckOneSet({"aab"}, "consecutive repeat: aab");
     var r := Infer({"aab"});
-    expect Matches(r, "aaab"), "expected a+b to still accept more a's";
+    expect Matches(r, "ab"), "expected a{1,2}b to still accept a single a";
+    expect !Matches(r, "aaab"), "expected the tight bound (maxRun=2) to reject a 3rd a";
     expect !Matches(r, "aabb"), "expected the tightened chain regex to reject a repeated trailing b";
   }
 
@@ -391,14 +391,14 @@ module Tests {
     // still applies - it never required equal total lengths, only that every sample is
     // longer than p - splitting into {"a","b"} and {"x","yy"}. The second piece then goes
     // through the ordinary machinery on its own: "x" and "yy" don't co-occur in any
-    // sample, so they land in separate co-occurrence groups and combine as x|y+ (using
-    // Plus rather than the literal "yy", to stay single-occurrence) - not grex's own
-    // (non-single-occurrence) "x"/"yy" choice, so this is checked directly against
-    // Matches rather than against compare_grex.py.
+    // sample, so they land in separate co-occurrence groups and combine as x|y{1,2} (a
+    // tightly bounded repeat of y, to stay single-occurrence while still not spelling out
+    // the literal "yy") - not grex's own (non-single-occurrence) "x"/"yy" choice, so this
+    // is checked directly against Matches rather than against compare_grex.py.
     CheckOneSet({"ax", "bx", "ayy", "byy"}, "independent axes with variable-length second axis");
     var r := Infer({"ax", "bx", "ayy", "byy"});
     expect Matches(r, "ax") && Matches(r, "bx") && Matches(r, "ayy") && Matches(r, "byy");
-    expect Matches(r, "ayyy"), "expected y+ to also accept more repetitions than observed";
+    expect !Matches(r, "ayyy"), "expected the tight bound (max y-run=2, from \"ayy\"/\"byy\") to reject a 3rd y";
     expect !Matches(r, "a"), "expected the second axis to be mandatory - neither x nor y";
     expect !Matches(r, "b"), "expected the second axis to be mandatory - neither x nor y";
     expect !Matches(r, "axyy"), "expected exactly one of {x, y+}, not both";
@@ -412,7 +412,7 @@ module Tests {
     CheckOneSet({"xa", "xb", "yya", "yyb"}, "fixed suffix, variable-length prefix");
     var r := Infer({"xa", "xb", "yya", "yyb"});
     expect Matches(r, "xa") && Matches(r, "xb") && Matches(r, "yya") && Matches(r, "yyb");
-    expect Matches(r, "yyya"), "expected y+ to also accept more repetitions than observed";
+    expect !Matches(r, "yyya"), "expected the tight bound (max y-run=2, from \"yya\"/\"yyb\") to reject a 3rd y";
     expect !Matches(r, "a"), "expected the first axis to be mandatory - neither x nor y";
     expect !Matches(r, "b"), "expected the first axis to be mandatory - neither x nor y";
     expect !Matches(r, "xyya"), "expected exactly one of {x, y+}, not both";
@@ -427,13 +427,14 @@ module Tests {
     // of {a,b}-characters is exactly its own axis-1 value ("a" or "bb"), disjoint from the
     // rest ("x"/"yyy"). grex's own answer for this input ("bb(?:yyy|x)|a(?:yyy|x)", roughly)
     // is itself NOT single-occurrence (b, x, y each appear more than once, spelled out
-    // literally) - the true single-occurrence target is (?:a|b+)(?:x|y+) - so this is
-    // checked directly against Matches, not compare_grex.py.
+    // literally) - the true single-occurrence target is (?:a|b{1,2})(?:x|y{1,3}), each
+    // repeated piece bounded by the tightest run actually observed - so this is checked
+    // directly against Matches, not compare_grex.py.
     CheckOneSet({"ax", "ayyy", "bbx", "bbyyy"}, "neither axis has a fixed length");
     var r := Infer({"ax", "ayyy", "bbx", "bbyyy"});
     expect Matches(r, "ax") && Matches(r, "bbx") && Matches(r, "ayyy") && Matches(r, "bbyyy");
-    expect Matches(r, "bx"), "expected b+ to also accept a single b, not just bb";
-    expect Matches(r, "ayyyy"), "expected y+ to also accept more repetitions than observed";
+    expect Matches(r, "bx"), "expected b{1,2} to also accept a single b, within the tight bound (max b-run=2)";
+    expect !Matches(r, "ayyyy"), "expected the tight bound (max y-run=3, from \"ayyy\"/\"bbyyy\") to reject a 4th y";
     expect !Matches(r, "a"), "expected the second axis to be mandatory - neither x nor y";
     expect !Matches(r, "x"), "expected the first axis to be mandatory - neither a nor b";
     expect !Matches(r, "axyyy"), "expected exactly one of {x, y+}, not both";
@@ -474,6 +475,22 @@ module Tests {
     expect Matches(r, "ABCDE") && Matches(r, "ACDE") && Matches(r, "ABE") && Matches(r, "AE");
     expect !Matches(r, "ACBDE"), "C before B is the wrong order";
     expect !Matches(r, "ABCBCDE"), "B and C must not repeat/mix";
+  }
+
+  method {:test} TestPlainRepeatedCharTightBound() {
+    // "aabbc"/"abbbc": a plain (non-periodic, non-wildcard-fallback) chain - order=[a,b,c]
+    // fits every sample via NoDup+CheckOrderAll, so this never reaches tier 2's periodic
+    // block (no shared period across the batch) or tier 3's wildcard fallback. It
+    // exercises the base chain/Slot machinery's own per-position bound instead: 'a'
+    // repeats up to 2 times (from "aabbc"'s leading "aa"), 'b' repeats up to 3 times (from
+    // "abbbc"'s "bbb") - two different tight bounds at two different positions in the
+    // same order, each computed independently of the other and of any shared block/length.
+    CheckOneSet({"aabbc", "abbbc"}, "plain repeated single chars: aabbc/abbbc");
+    var r := Infer({"aabbc", "abbbc"});
+    expect Matches(r, "aabbc") && Matches(r, "abbbc");
+    expect Matches(r, "abc"), "expected a{1,2}b{1,3}c to still accept a single a and single b";
+    expect !Matches(r, "aaabbc"), "expected the tight bound (max a-run=2) to reject a 3rd a";
+    expect !Matches(r, "abbbbc"), "expected the tight bound (max b-run=3) to reject a 4th b";
   }
 
   // ---- Small deterministic PRNG + fuzz loop ----
