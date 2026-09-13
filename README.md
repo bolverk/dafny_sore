@@ -811,6 +811,41 @@ anything; if that check ever fails it means `PrettyPrint`/`Simplify` disagrees w
 proved `Matches` semantics, and `sore.py` reports it as an internal error rather than
 silently emitting a wrong regex.
 
+## The bigram-graph alternative implementation
+
+`src/Graph.dfy` (module `BigramGraph`) is a second, completely standalone SORE-inference
+implementation, based on contracting a graph built from the input strings' bigrams
+(adjacent-character pairs) down to a single node — see the module's own header comment
+for the full algorithm (bigram-graph construction, simple-path/self-loop/exact-overlap/
+optional/SCC contractions, a topological chain-wrap, and a wildcard fallback of last
+resort) and `InferViaBigramGraph`'s `ensures` clauses for its own soundness/soreness
+theorems, proved completely independently of `Infer`/`Chain.dfy`. It shares only the
+`Regex`/`Matches`/`IsSore` core in `Regex.dfy` with the tiered implementation above —
+no other code or proof is reused between the two.
+
+`sore_bigram.py` gives you this second implementation as the same kind of command-line
+tool as `sore.py`, for comparing the two side by side:
+
+```sh
+dafny build --target:py src/Regex.dfy src/Graph.dfy src/Print.dfy src/MainBigram.dfy --output build/sore_bigram
+python3 ./sore_bigram.py B C BC
+# B?C?
+python3 ./sore_bigram.py abc adc
+# a[bd]c
+python3 ./sore_bigram.py abab
+# [ab]*    (sound, but looser than sore.py's (?:ab)+ — see "Known limitations" in
+#           Graph.dfy's header: the bigram-graph algorithm's only repetition
+#           mechanism, SCC contraction, is inherently order-blind for genuine cycles)
+```
+
+Same CLI conventions and the same `re.fullmatch` self-check defense-in-depth as
+`sore.py` (see above) — `sore_bigram.py` is a near-identical wrapper, just pointing at
+`MainBigram`/`build/sore_bigram-py/` instead of `Main`/`build/sore-py/`.
+
+`GraphTests.dfy` holds this implementation's own `{:test}` suite (run with
+`dafny test --target:js src/Regex.dfy src/Graph.dfy src/GraphTests.dfy`), separate from
+`Tests.dfy`'s.
+
 ## Differential testing against `grex`
 
 [`grex`](https://github.com/pemistahl/grex) is a mature, independent regex-inference
