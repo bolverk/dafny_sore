@@ -564,6 +564,93 @@
 // tightening versus the wildcard it replaces. {"cat","car","cab"} and {"abc","adc"} are
 // both unaffected (resolved earlier by FindExactMergePair, never reaching TopoSort at
 // all), confirming no regression on inputs the pipeline already handled well.
+//
+// ROUND 12 replaces the unbounded Plus this file's own Round 9 introduced
+// (CanLoopToPlus/LoopToPlusGraph/LoopToPlusSound/FindSelfLoopNode - the self-loop-to-Plus
+// contraction) with the tightest RepRange bound that still accepts every input string -
+// the first of several planned rounds doing this across the file (SCC-contraction's
+// Star and CollapseAllGraph's whole-graph-collapse Star are deliberately left for later
+// rounds: genuine nesting is possible there, unlike the self-loop case, which is
+// tractable on its own - see below). This mirrors a companion effort that already did the
+// analogous replacement for the OTHER, unrelated tiered implementation in this project
+// (Chain.dfy/Infer.dfy's own two RepRange call sites, via MaxKForPeriod/MaxLenBound-style
+// folds) - this round reuses that effort's general SHAPE (fold a tight bound over the
+// input set, build a MatchesKCopies witness for the actual count used, hand both to
+// Regex.dfy's MatchesKCopiesImpliesRepRange) but shares no code with it, keeping this
+// file standalone exactly as its own header above insists.
+//
+// Why the self-loop case is tractable on its own: CanLoopToPlus now additionally requires
+// g.labels[v].Sym? - i.e. v's label must literally BE a bare Sym(c), not a REQUIREMENT
+// derived from some file-wide invariant threaded through every other contraction rule
+// (which would be a much bigger undertaking, deferred to whenever SCC-contraction/
+// CollapseAllGraph get their own turn), but a directly-checkable STRUCTURAL strengthening
+// of CanLoopToPlus's own precondition - confirmed by inspection to never exclude any
+// self-loop this pipeline actually produces: simple-path/exact-merge/optional
+// contraction all exclude self-looped candidates from their own preconditions already
+// (Rounds 2-4/10), and SCC-contraction/CollapseAllGraph (Rounds 5/6) always allocate a
+// FRESH node for the merged result (never reusing v's id) whose only edges connect to
+// nodes OUTSIDE the contracted set - so the fresh node can never end up with a self-loop
+// back to itself, meaning a self-loop can only ever survive on a node that was never
+// touched by any contraction, i.e. still carries its original bigram-graph Sym(c) label.
+// Making this a structural check (rather than a proof obligation) means a future input
+// that somehow violated the assumption would simply not fire CanLoopToPlus there (reduced
+// precision, falling through to the next driver rule - no soundness bug), the same
+// "propose a candidate heuristically, prove whatever was proposed sound" spirit
+// SCCCandidate/CanContractSCC (Round 8) already use.
+//
+// The bound: since g.labels[v] == Sym(c), every one of the k repetitions collapsed
+// through v's self-loop contributes EXACTLY one occurrence of c, so the number of times
+// the loop needs to be traversed to explain any one accepted string w is exactly the
+// length of some run of consecutive c's inside w. LongestRun(w, c) (built from RunAt, the
+// run-length starting at w's very front) computes the longest such run; MaxRunOverSet
+// folds LongestRun over the ORIGINAL top-level input set S, giving maxRun - the single
+// tightest bound valid for every sample. LoopToPlusGraph(g, v, maxRun) now emits
+// RepRange(g.labels[v], 1, maxRun) in place of the old Plus(g.labels[v]); InferViaBigramGraph
+// computes maxRun via MaxRunOverSet(S, c) right where FindSelfLoopNode finds v (now also
+// returning c, the symbol g.labels[v] == Sym(c)), and threads it through
+// ExecLoopToPlus/LoopStepLoopToPlus alongside c.
+//
+// Proof engineering: LoopToPlusSound's old proof built Matches(Plus(g.labels[v]), ...) by
+// peeling one repetition off as Plus's own existential witness and handing the rest to
+// StarOfUnionAccepts (SCC section) - but Plus/Star's OWN existentials never remember which
+// repetition count was actually used, so there would be no k to hand
+// MatchesKCopiesImpliesRepRange afterwards. The fix: KCopiesOfRunAccepts (replacing the old
+// PlusOfRunAccepts) builds MatchesKCopies(g.labels[v], ..., k) directly for the run's ACTUAL
+// k, by induction on the run itself (peeling the first piece off and recombining via a new
+// SliceSplit lemma) rather than routing through Plus/Star at all. KCopiesSymAllC then
+// unfolds that MatchesKCopies(Sym(c), s, k) fact (Sym(c)'s own definition forces every one
+// of its k pieces to be exactly the character c) to show s is exactly k copies of c back to
+// back; LongestRunLowerBoundAt turns "s is a k-long run of c's somewhere in w" into
+// LongestRun(w, c) >= k, which combined with the caller's LongestRun(w, c) <= maxRun
+// hypothesis gives the 1 <= k <= maxRun MatchesKCopiesImpliesRepRange needs (k >= 1 holds
+// already since a self-loop traversal requires at least one pass). RunAt/LongestRun are
+// marked {:opaque} (revealed only inside the two lemmas that unfold them): both are
+// unbounded recursive functions over an arbitrary string, and leaving them transparent let
+// the solver's automatic unfolding axiom fire on every occurrence anywhere in context -
+// including LoopStepsPreservesRun's own unrelated recursion over a walk of unbounded
+// length, which carries a LongestRun(w, c) <= maxRun hypothesis unchanged through every
+// recursive call - empirically confirmed to blow up verification time badly until made
+// opaque. A second, distinct verification-robustness issue hit along the way: the
+// established SplitsOkImpliesForall bridge (used elsewhere in this file for callees whose
+// signature is fixed) verified fine under `dafny verify` but intermittently failed the
+// very next call's precondition-check under `dafny test`/`dafny build` specifically, for
+// this round's new KCopiesOfRunAccepts/KCopiesOfRunAcceptsFromWalk pair - since both
+// lemmas are new and fully under this round's control, the fix was to have
+// KCopiesOfRunAccepts take the bundled SplitsOk(...) predicate directly as a precondition
+// (reading individual indices back out via SplitsOkAt) instead of the raw unfolded
+// per-index forall, sidestepping the fragile hand-off entirely rather than working around
+// it.
+//
+// Example: for S = {"ax", "ayyy", "bbx", "bbyyy"} (Round 9's own running example), before
+// this round InferViaBigramGraph produced
+// Concat(Union(Sym('a'),Plus(Sym('b'))),Union(Sym('x'),Plus(Sym('y')))) - i.e. (a|b+)(x|y+)
+// - which wrongly accepted arbitrarily long runs of 'b' or 'y' (e.g. "bbbx", "ayyyyy").
+// After this round it produces
+// Concat(Union(Sym('a'),RepRange(Sym('b'),1,2)),Union(Sym('x'),RepRange(Sym('y'),1,3))) -
+// i.e. (a|b{1,2})(x|y{1,3}) - since the longest run of 'b' across the input is 2 (from
+// "bbx"/"bbyyy") and the longest run of 'y' is 3 (from "ayyy"): it still accepts every
+// sample but now correctly rejects "bbbx" and "ayyyy" too (confirmed empirically; see
+// GraphTests.dfy's updated TestSelfLoopToPlusTightening and its new fuzz-style companion).
 module BigramGraph {
   import opened RegexCore
 
@@ -4782,66 +4869,238 @@ module BigramGraph {
   // example, root cause, and the resulting before/after regex).
   // ==================================================================================
 
-  // The !Matches(g.labels[v], "") conjunct is what makes LoopToPlusSound provable in
-  // general (see the module header comment): every repetition piece collapsed into the
-  // new Plus(labels[v]) step must be non-empty, and this is what guarantees that. It costs
-  // nothing on any input this pipeline actually produces - a self-looped node's label is
-  // always still its original, never-nullable Sym(c) (every other contraction rule
-  // excludes self-looped candidates from its own precondition, so nothing ever gets the
-  // chance to relabel one into something nullable before this rule fires).
+  // ---- ROUND 12 addition: tight RepRange bound in place of the unbounded Plus above ----
+  //
+  // CanLoopToPlus now also requires g.labels[v] to literally BE Sym(c) for some c (the
+  // new `g.labels[v].Sym?` conjunct below) - a structural, directly-checkable strengthening
+  // rather than a global invariant threaded through every other contraction rule in this
+  // file (which would be a much bigger undertaking - see this file's header comment for
+  // why that's out of scope this round). This costs nothing on any input this pipeline
+  // actually produces: exactly as the old comment here already argued, a self-loop only
+  // ever survives on a node whose label is still its original, un-relabeled bigram-graph
+  // Sym(c) (every other contraction rule - simple-path, exact-merge/MergeAny, optional,
+  // SCC-contraction, collapse-all - either excludes self-looped candidates from its own
+  // precondition, or (for SCC-contraction/collapse-all) only ever assigns the FRESH
+  // contracted node a Star/RepRange-shaped label, never Sym(c), and never gives that fresh
+  // node a self-loop back to itself - see FreshNode-ness of ContractSCCGraph/
+  // MergeAnyGraph/ContractSimplePathGraph). Making the check structural (rather than a
+  // file-wide proof obligation) means: if this assumption were ever violated on some
+  // future input, CanLoopToPlus simply wouldn't fire there (no soundness bug, just reduced
+  // precision, falling through to the next rule in the driver's priority order) - the same
+  // "propose a candidate heuristically, prove whatever was proposed sound" spirit
+  // SCCCandidate/CanContractSCC already use elsewhere in this file.
+  //
+  // Since g.labels[v] == Sym(c), every one of the k repetitions collapsed through v's
+  // self-loop contributes EXACTLY one occurrence of c to the accepted string, so the
+  // actual number of repetitions needed to explain any one accepted string w is exactly
+  // the length of some run of consecutive c's inside w. RunAt(w, c) is the length of the
+  // run of c's starting exactly at w's front; LongestRun(w, c) is the max of RunAt over
+  // every suffix of w, i.e. the longest run of c anywhere in w. MaxRunOverSet folds
+  // LongestRun over the ORIGINAL top-level input set S, giving the single tightest bound
+  // valid for every sample - mirroring Chain.dfy/Infer.dfy's MaxKForPeriod/MaxLenBound
+  // fold-over-strs pattern (see those files, and Infer.dfy's own two RepRange call sites,
+  // for the general shape) but for "longest run of one repeated character" rather than
+  // "period block count" or "whole-sample length". LoopToPlusGraph below now takes this
+  // bound as an explicit maxRun parameter and emits RepRange(g.labels[v], 1, maxRun)
+  // instead of the old unbounded Plus(g.labels[v]) - InferViaBigramGraph computes maxRun
+  // via MaxRunOverSet(S, c) at the point FindSelfLoopNode finds v labeled Sym(c), and
+  // passes it through ExecLoopToPlus/LoopStepLoopToPlus.
+  //
+  // Example: for S = {"ax", "ayyy", "bbx", "bbyyy"} (this file's own running example, see
+  // the Round 9 comment above), before this round InferViaBigramGraph produced
+  // Concat(Union(Sym('a'),Plus(Sym('b'))),Union(Sym('x'),Plus(Sym('y')))) - i.e. (a|b+)(x|y+)
+  // - which wrongly accepted arbitrarily long runs of 'b' or 'y' (e.g. "bbbx", "ayyyyy").
+  // After this round it produces
+  // Concat(Union(Sym('a'),RepRange(Sym('b'),1,2)),Union(Sym('x'),RepRange(Sym('y'),1,3))) -
+  // i.e. (a|b{1,2})(x|y{1,3}) - since the longest run of 'b' across the input is 2 (from
+  // "bbx"/"bbyyy") and the longest run of 'y' is 3 (from "ayyy"): it still accepts every
+  // sample but now correctly rejects "bbbx" and "ayyyy" too (confirmed empirically; see
+  // GraphTests.dfy's TestSelfLoopToPlusTightening).
+
+  // Marked {:opaque} deliberately: both are plain unbounded recursive functions over an
+  // arbitrary string w, and leaving them transparent would let the solver's automatic
+  // function-unfolding axiom fire on every occurrence of RunAt/LongestRun anywhere in
+  // context - including all through LoopStepsPreserves/…Untouched/…Run's own unrelated
+  // recursion over a walk of unbounded length, which carries a `LongestRun(w, c) <=
+  // maxRun` hypothesis unchanged through every recursive call. That combination was
+  // empirically confirmed to blow up verification time badly; keeping both opaque (and
+  // `reveal`-ing them only inside the two lemmas below that actually need to unfold
+  // them) avoids the problem entirely, since every OTHER call site only ever needs to
+  // treat `LongestRun(w, c) <= maxRun` as an opaque fact to carry along, never to unfold.
+  function {:opaque} RunAt(w: string, c: char): nat
+    decreases |w|
+  {
+    if w == "" || w[0] != c then 0
+    else 1 + RunAt(w[1..], c)
+  }
+
+  function {:opaque} LongestRun(w: string, c: char): nat
+    decreases |w|
+  {
+    if w == "" then 0
+    else
+      var here := RunAt(w, c);
+      var rest := LongestRun(w[1..], c);
+      if here > rest then here else rest
+  }
+
+  // If the first k characters of w are all c, the run starting at w's front is at least
+  // k long.
+  lemma RunAtLowerBound(w: string, c: char, k: nat)
+    requires k <= |w|
+    requires forall i :: 0 <= i < k ==> w[i] == c
+    ensures RunAt(w, c) >= k
+    decreases k
+  {
+    reveal RunAt();
+    if k == 0 {
+    } else {
+      RunAtLowerBound(w[1..], c, k - 1);
+    }
+  }
+
+  // If w[lo..hi] is all c, LongestRun(w, c) is at least as long as that window - the
+  // general fact tying "some contiguous window of w is all c" back to LongestRun,
+  // regardless of where in w that window sits (RunAtLowerBound alone only covers windows
+  // starting at index 0).
+  lemma LongestRunLowerBoundAt(w: string, c: char, lo: nat, hi: nat)
+    requires lo <= hi <= |w|
+    requires forall i :: lo <= i < hi ==> w[i] == c
+    ensures LongestRun(w, c) >= hi - lo
+    decreases lo
+  {
+    reveal LongestRun();
+    if lo == 0 {
+      forall i | 0 <= i < hi ensures w[i] == c {
+      }
+      RunAtLowerBound(w, c, hi);
+    } else {
+      var w' := w[1..];
+      forall i | lo - 1 <= i < hi - 1 ensures w'[i] == c {
+        assert w'[i] == w[i + 1];
+      }
+      LongestRunLowerBoundAt(w', c, lo - 1, hi - 1);
+    }
+  }
+
+  // Executable fold of LongestRun over the input set, exactly mirroring
+  // MaxKForPeriod/MaxLen's role in Chain.dfy but over a set (via a `:|`-driven drain loop,
+  // like SetToSeqExec/BuildBigramGraph's own set-draining loops elsewhere in this file)
+  // rather than a seq, since InferViaBigramGraph's own S is a set<string>.
+  method MaxRunOverSet(S: set<string>, c: char) returns (m: nat)
+    ensures forall w :: w in S ==> LongestRun(w, c) <= m
+  {
+    m := 0;
+    var rem := S;
+    while rem != {}
+      invariant forall w :: w in S - rem ==> LongestRun(w, c) <= m
+      decreases rem
+    {
+      var w :| w in rem;
+      var lr := LongestRun(w, c);
+      if lr > m {
+        m := lr;
+      }
+      rem := rem - {w};
+    }
+  }
+
+  // A slice of a slice of w agrees with slicing w directly at the corresponding absolute
+  // offsets - needed to combine two adjacent per-piece Matches facts (each stated
+  // relative to w) into one MatchesKCopies fact about the whole run's substring
+  // w[lo..hi], analogous to Regex.dfy's own SliceOfSuffix but for an interior split point
+  // of an already-taken slice rather than a suffix.
+  lemma SliceSplit(w: string, lo: nat, mid: nat, hi: nat)
+    requires lo <= mid <= hi <= |w|
+    ensures w[lo..hi][..mid - lo] == w[lo..mid]
+    ensures w[lo..hi][mid - lo..] == w[mid..hi]
+  {
+    forall idx | 0 <= idx < mid - lo ensures w[lo..hi][idx] == w[lo..mid][idx] {
+    }
+    forall idx | 0 <= idx < hi - mid ensures w[lo..hi][mid - lo..][idx] == w[mid..hi][idx] {
+    }
+  }
+
+  // Unfolds a MatchesKCopies(Sym(c), s, k) witness: Sym(c)'s own definition forces each of
+  // its k pieces to be exactly the single character c, so s itself is forced to be exactly
+  // k copies of c back to back - the fact that lets a run's actual repetition count k be
+  // related back to LongestRun(w, c) via LongestRunLowerBoundAt above.
+  lemma KCopiesSymAllC(c: char, s: string, k: nat)
+    requires MatchesKCopies(Sym(c), s, k)
+    ensures |s| == k
+    ensures forall i :: 0 <= i < |s| ==> s[i] == c
+    decreases k
+  {
+    if k == 0 {
+    } else {
+      var i :| 0 <= i <= |s| && Matches(Sym(c), s[..i]) && MatchesKCopies(Sym(c), s[i..], k - 1);
+      assert s[..i] == [c];
+      assert i == |s[..i]|;
+      assert i == 1;
+      KCopiesSymAllC(c, s[i..], k - 1);
+      forall idx | 0 <= idx < |s| ensures s[idx] == c {
+        if idx == 0 {
+        } else {
+          assert s[idx] == s[i..][idx - 1];
+        }
+      }
+    }
+  }
+
   predicate CanLoopToPlus(g: Graph, v: int)
     requires WF(g)
   {
     v in g.nodes && v != g.start && v != g.end && (v, v) in g.edges &&
-    !Matches(g.labels[v], "")
+    !Matches(g.labels[v], "") &&
+    g.labels[v].Sym?
   }
 
-  ghost function LoopToPlusGraph(g: Graph, v: int): Graph
+  ghost function LoopToPlusGraph(g: Graph, v: int, maxRun: nat): Graph
     requires WF(g)
     requires CanLoopToPlus(g, v)
   {
-    Graph(g.nodes, g.labels[v := Plus(g.labels[v])], g.edges - {(v, v)}, g.start, g.end)
+    Graph(g.nodes, g.labels[v := RepRange(g.labels[v], 1, maxRun)], g.edges - {(v, v)}, g.start, g.end)
   }
 
-  lemma LoopToPlusWF(g: Graph, v: int)
+  lemma LoopToPlusWF(g: Graph, v: int, maxRun: nat)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    ensures WF(LoopToPlusGraph(g, v))
+    ensures WF(LoopToPlusGraph(g, v, maxRun))
   {
-    var g' := LoopToPlusGraph(g, v);
+    var g' := LoopToPlusGraph(g, v, maxRun);
     assert g'.start in g'.nodes && g'.end in g'.nodes;
     forall e | e in g'.edges ensures e.0 in g'.nodes && e.1 in g'.nodes {
       assert e in g.edges;
     }
   }
 
-  lemma LoopToPlusAllLabelsSore(g: Graph, v: int)
+  lemma LoopToPlusAllLabelsSore(g: Graph, v: int, maxRun: nat)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires CanLoopToPlus(g, v)
-    ensures WF(LoopToPlusGraph(g, v))
-    ensures AllLabelsSore(LoopToPlusGraph(g, v))
+    ensures WF(LoopToPlusGraph(g, v, maxRun))
+    ensures AllLabelsSore(LoopToPlusGraph(g, v, maxRun))
   {
-    LoopToPlusWF(g, v);
-    var g' := LoopToPlusGraph(g, v);
+    LoopToPlusWF(g, v, maxRun);
+    var g' := LoopToPlusGraph(g, v, maxRun);
     forall n | n in g'.nodes ensures IsSore(g'.labels[n]) {
       if n == v {
-        PlusIsSore(g.labels[v]);
+        RepRangeIsSore(g.labels[v], 1, maxRun);
       }
     }
   }
 
-  lemma LoopToPlusPairwiseDisjoint(g: Graph, v: int)
+  lemma LoopToPlusPairwiseDisjoint(g: Graph, v: int, maxRun: nat)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires CanLoopToPlus(g, v)
-    ensures WF(LoopToPlusGraph(g, v))
-    ensures PairwiseDisjointLabels(LoopToPlusGraph(g, v))
+    ensures WF(LoopToPlusGraph(g, v, maxRun))
+    ensures PairwiseDisjointLabels(LoopToPlusGraph(g, v, maxRun))
   {
-    LoopToPlusWF(g, v);
-    var g' := LoopToPlusGraph(g, v);
+    LoopToPlusWF(g, v, maxRun);
+    var g' := LoopToPlusGraph(g, v, maxRun);
     forall n1, n2 | n1 in g'.nodes && n2 in g'.nodes && n1 != n2
       ensures forall c :: Symbols(g'.labels[n1])[c] == 0 || Symbols(g'.labels[n2])[c] == 0
     {
@@ -4853,39 +5112,39 @@ module BigramGraph {
     }
   }
 
-  lemma LoopToPlusNoBackEdges(g: Graph, v: int)
+  lemma LoopToPlusNoBackEdges(g: Graph, v: int, maxRun: nat)
     requires WF(g)
     requires CanLoopToPlus(g, v)
     requires NoBackEdges(g)
-    ensures NoBackEdges(LoopToPlusGraph(g, v))
+    ensures NoBackEdges(LoopToPlusGraph(g, v, maxRun))
   {
   }
 
-  lemma LoopToPlusSentinels(g: Graph, v: int)
+  lemma LoopToPlusSentinels(g: Graph, v: int, maxRun: nat)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    ensures WF(LoopToPlusGraph(g, v))
-    ensures LoopToPlusGraph(g, v).start == g.start
-    ensures LoopToPlusGraph(g, v).end == g.end
-    ensures LoopToPlusGraph(g, v).labels[g.start] == g.labels[g.start]
-    ensures LoopToPlusGraph(g, v).labels[g.end] == g.labels[g.end]
+    ensures WF(LoopToPlusGraph(g, v, maxRun))
+    ensures LoopToPlusGraph(g, v, maxRun).start == g.start
+    ensures LoopToPlusGraph(g, v, maxRun).end == g.end
+    ensures LoopToPlusGraph(g, v, maxRun).labels[g.start] == g.labels[g.start]
+    ensures LoopToPlusGraph(g, v, maxRun).labels[g.end] == g.labels[g.end]
   {
-    LoopToPlusWF(g, v);
+    LoopToPlusWF(g, v, maxRun);
   }
 
-  lemma InteriorNodesLoopToPlus(g: Graph, v: int)
+  lemma InteriorNodesLoopToPlus(g: Graph, v: int, maxRun: nat)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    ensures InteriorNodes(LoopToPlusGraph(g, v)) == InteriorNodes(g)
+    ensures InteriorNodes(LoopToPlusGraph(g, v, maxRun)) == InteriorNodes(g)
   {
   }
 
-  lemma EdgeCountLoopToPlus(g: Graph, v: int)
+  lemma EdgeCountLoopToPlus(g: Graph, v: int, maxRun: nat)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    ensures |LoopToPlusGraph(g, v).edges| < |g.edges|
+    ensures |LoopToPlusGraph(g, v, maxRun).edges| < |g.edges|
   {
-    var g' := LoopToPlusGraph(g, v);
+    var g' := LoopToPlusGraph(g, v, maxRun);
     assert g'.edges == g.edges - {(v, v)};
     CardEdgesRemoveNonempty(g.edges, {(v, v)});
   }
@@ -4899,111 +5158,111 @@ module BigramGraph {
   // contraction, so no into_m/outof_m redirection is needed either: every edge other than
   // the removed self-loop (v,v) survives unchanged, whichever node it touches).
 
-  // Peels one repetition off (Plus's own existential witness) and hands the rest to the
-  // already-proven, already-robust StarOfUnionAccepts, instantiated at the singleton
-  // C := {v}, cs := [v] - UnionAllLabels(g, [v]) reduces, by its own one-element-sequence
-  // case, to exactly g.labels[v], so Star(UnionAllLabels(g, [v])) IS Star(g.labels[v]),
-  // no separate equivalence lemma needed. This reuses StarOfUnionAccepts's own SCC-section
-  // proof verbatim instead of re-deriving an analogous induction from scratch - and,
-  // crucially for verification robustness (see the module header's note on dafny-verify-
-  // clean-but-dafny-test-flaky failures), keeps every per-index fact indexed through
-  // `run[i]`/`runSplits[i]` (plain sequence lookups, exactly StarOfUnionAccepts's own
-  // trigger shape) rather than hoisting "which node"/"which offset" into a fixed constant
-  // or arithmetic offset - an earlier version of this proof hoisted g.labels[v] out of the
-  // per-index quantifier (and, separately, tried an arithmetic start-offset instead of
-  // re-slicing run/runSplits at each step) and verified cleanly under `dafny verify`, but
-  // intermittently failed to re-derive the very same `forall` precondition specifically
-  // under `dafny test`/`dafny build` - Dafny reported "could not find a trigger" for
-  // exactly those hoisted/arithmetic-indexed quantifiers, unlike the plain `run[i]`/
-  // `runSplits[i]` shape used here and throughout the pre-existing SCC section.
-  lemma PlusOfRunAccepts(g: Graph, v: int, run: seq<int>, runSplits: seq<nat>, w: string)
+  // ROUND 12: replaces the old PlusOfRunAccepts (which peeled one repetition off as
+  // Plus's own existential witness and handed the rest to StarOfUnionAccepts) with a
+  // direct construction of MatchesKCopies(g.labels[v], ..., k) for the run's ACTUAL
+  // repetition count k. Going through Plus/Star's own existentials (as the old proof
+  // did) erases which k was actually used - Matches(Plus(r), s) only remembers THAT some
+  // split worked, not how many pieces it took - so there would be no way to recover the
+  // count needed to invoke MatchesKCopiesImpliesRepRange afterwards. Building
+  // MatchesKCopies directly (by induction on the run, peeling the FIRST piece off and
+  // combining it with the recursively-built rest via SliceSplit) keeps k explicit
+  // throughout, exactly mirroring Regex.dfy's own MatchesKCopies recursive structure
+  // instead of Chain.dfy's UnionKCopies-style per-character recursion (that file's
+  // closest analogue) - here recursing per split-piece instead of per character, since a
+  // "copy" here is a whole g.labels[v]-shaped piece, not a single symbol.
+  // Takes SplitsOk(g, run, runSplits, w) directly as a precondition (rather than the
+  // raw unfolded `forall i :: ... ==> var lo := ...; var hi := ...; ...` shape) and
+  // reads each index's fact back out via SplitsOkAt, rather than via the
+  // SplitsOkImpliesForall bridge used elsewhere in this file (e.g. by
+  // ChainWrapAux/PlusOfRunAccepts's own predecessor) - that bridge exists specifically
+  // for callees whose signature is otherwise fixed and can't be changed to take
+  // SplitsOk directly; since this lemma is new and under our control, requiring
+  // SplitsOk directly sidesteps the "prove the raw forall via SplitsOkImpliesForall,
+  // then have the very next call's precondition-check re-derive that SAME forall"
+  // hand-off, which was empirically confirmed (like several other spots this file's
+  // module header documents) to verify fine under `dafny verify` but fail
+  // intermittently under `dafny test`/`dafny build`.
+  lemma KCopiesOfRunAccepts(g: Graph, v: int, run: seq<int>, runSplits: seq<nat>, w: string)
     requires WF(g)
     requires v in g.nodes
     requires |run| >= 1
-    requires |runSplits| == |run| + 1
-    requires runSplits[0] <= |w|
-    requires !Matches(g.labels[v], "")
     requires forall i :: 0 <= i < |run| ==> run[i] == v
-    requires forall i :: 0 <= i < |run| ==>
-               var lo := runSplits[i]; var hi := runSplits[i + 1];
-               lo <= hi <= |w| && Matches(g.labels[run[i]], w[lo..hi])
+    requires SplitsOk(g, run, runSplits, w)
+    requires runSplits[0] <= |w|
     ensures runSplits[0] <= runSplits[|run|] <= |w|
-    ensures Matches(Plus(g.labels[v]), w[runSplits[0]..runSplits[|run|]])
+    ensures MatchesKCopies(g.labels[v], w[runSplits[0]..runSplits[|run|]], |run|)
+    decreases |run|
   {
     var k := |run|;
-    var restRun := run[1..];
-    var restSplits := runSplits[1..];
-    forall i | 0 <= i < |restRun| ensures restRun[i] == v {
-      assert restRun[i] == run[i + 1];
-    }
-    // Routed through SplitsOk/SplitsOkImpliesForall (see their comments above
-    // ChainWrapAux) instead of leaving this call's identically-shaped `requires`
-    // conjunct to be matched directly against a local `forall` statement's fact - the
-    // same "verifies fine alone, fails to be picked up by the next call" brittleness
-    // documented at SplitsOkImpliesForall, which started biting this call too once the
-    // shared Regex datatype grew a new constructor (RepRange).
-    forall i | 0 <= i < |restRun| ensures restRun[i] in g.nodes {
-    }
-    assert SplitsOk(g, restRun, restSplits, w) by {
-      forall i | 0 <= i < |restRun|
-        ensures var lo := restSplits[i]; var hi := restSplits[i + 1];
-                lo <= hi <= |w| && Matches(g.labels[restRun[i]], w[lo..hi])
-      {
+    assert run[0] == v;
+    SplitsOkAt(g, run, runSplits, w, 0);
+    var lo0 := runSplits[0];
+    var hi0 := runSplits[1];
+    assert lo0 <= hi0 <= |w| && Matches(g.labels[v], w[lo0..hi0]);
+    if k == 1 {
+      var s := w[lo0..hi0];
+      assert s[..|s|] == s;
+      assert s[|s|..] == "";
+      assert MatchesKCopies(g.labels[v], s, 1) by {
+        assert 0 <= |s| <= |s| && Matches(g.labels[v], s[..|s|]) && MatchesKCopies(g.labels[v], s[|s|..], 0);
+      }
+    } else {
+      var restRun := run[1..];
+      var restSplits := runSplits[1..];
+      forall i | 0 <= i < |restRun| ensures restRun[i] == v {
         assert restRun[i] == run[i + 1];
-        assert restSplits[i] == runSplits[i + 1];
-        assert restSplits[i + 1] == runSplits[i + 2];
       }
-    }
-    assert restSplits[0] <= |w| by {
+      forall i | 0 <= i < |restRun| ensures restRun[i] in g.nodes {
+      }
+      assert SplitsOk(g, restRun, restSplits, w) by {
+        forall i | 0 <= i < |restRun|
+          ensures var lo := restSplits[i]; var hi := restSplits[i + 1];
+                  lo <= hi <= |w| && Matches(g.labels[restRun[i]], w[lo..hi])
+        {
+          SplitsOkAt(g, run, runSplits, w, i + 1);
+          assert restRun[i] == run[i + 1];
+          assert restSplits[i] == runSplits[i + 1];
+          assert restSplits[i + 1] == runSplits[i + 2];
+        }
+      }
+      assert restSplits[0] <= |w| by {
+        assert restSplits[0] == runSplits[1];
+      }
+      KCopiesOfRunAccepts(g, v, restRun, restSplits, w);
       assert restSplits[0] == runSplits[1];
-      assert var lo := runSplits[0]; var hi := runSplits[1]; lo <= hi <= |w|;
-    }
-    SplitsOkImpliesForall(g, restRun, restSplits, w);
-    StarOfUnionAccepts(g, {v}, [v], restRun, restSplits, w);
-    assert UnionAllLabels(g, [v]) == g.labels[v];
-    assert Matches(g.labels[v], w[runSplits[0]..runSplits[1]]) by {
-      assert run[0] == v;
-      assert var lo := runSplits[0]; var hi := runSplits[1]; lo <= hi <= |w| && Matches(g.labels[run[0]], w[lo..hi]);
-    }
-    assert restSplits[0] == runSplits[1];
-    assert restSplits[k - 1] == runSplits[k];
-    assert Matches(Star(g.labels[v]), w[runSplits[1]..runSplits[k]]);
-    assert runSplits[0] <= runSplits[1];
-    assert runSplits[1] <= runSplits[k];
-    assert runSplits[1] - runSplits[0] > 0 by {
-      if runSplits[1] - runSplits[0] == 0 {
-        assert w[runSplits[0]..runSplits[1]] == "";
+      assert restSplits[k - 1] == runSplits[k];
+      assert MatchesKCopies(g.labels[v], w[runSplits[1]..runSplits[k]], k - 1);
+      assert runSplits[0] <= runSplits[1] <= runSplits[k] <= |w|;
+
+      SliceSplit(w, runSplits[0], runSplits[1], runSplits[k]);
+      var s := w[runSplits[0]..runSplits[k]];
+      var idx := runSplits[1] - runSplits[0];
+      assert s[..idx] == w[runSplits[0]..runSplits[1]];
+      assert s[idx..] == w[runSplits[1]..runSplits[k]];
+      assert MatchesKCopies(g.labels[v], s, k) by {
+        assert 0 <= idx <= |s|;
+        assert Matches(g.labels[v], s[..idx]) && MatchesKCopies(g.labels[v], s[idx..], k - 1);
       }
-    }
-    assert Matches(Plus(g.labels[v]), w[runSplits[0]..runSplits[k]]) by {
-      assert 0 < runSplits[1] - runSplits[0] <= runSplits[k] - runSplits[0];
-      assert w[runSplits[0]..runSplits[k]][..runSplits[1] - runSplits[0]] == w[runSplits[0]..runSplits[1]];
-      assert w[runSplits[0]..runSplits[k]][runSplits[1] - runSplits[0]..] == w[runSplits[1]..runSplits[k]];
     }
   }
 
   // Wraps "slice a run of k consecutive v-labeled steps off the front of a StepsOk
-  // witness, then call PlusOfRunAccepts on it" into its own small, self-contained
-  // lemma. LoopStepsPreservesRun's own call site used to do all of this inline
-  // (computing run/runSplits, establishing PlusOfRunAccepts's per-index `Matches`
-  // precondition via SplitsOk/SplitsOkImpliesForall, then calling PlusOfRunAccepts) -
-  // that inline form verified fine under `dafny verify` but was empirically confirmed
-  // to still intermittently fail under `dafny test`/`dafny build`'s invocation mode
-  // specifically, evidently because LoopStepsPreservesRun's own body is otherwise large
-  // enough (many other assertions/lemma calls) to perturb this step's proof search even
-  // though every piece of it verifies fine in isolation. Moving the whole "slice +
-  // establish + call" sequence into this separate, minimal procedure - rather than just
-  // the "establish" part, as SplitsOkImpliesForall alone did for other call sites - is
-  // what actually holds up under both invocation modes.
-  lemma PlusOfRunAcceptsFromWalk(g: Graph, v: int, walk: seq<int>, splits: seq<nat>, w: string, k: int)
+  // witness, then call KCopiesOfRunAccepts on it" into its own small, self-contained
+  // lemma - mirroring the superseded PlusOfRunAcceptsFromWalk's own reason for existing
+  // as a separate lemma (see its comment, preserved in spirit): LoopStepsPreservesRun's
+  // body is otherwise large enough that an inline "slice + establish + call" sequence
+  // was empirically confirmed, for its Plus-based predecessor, to intermittently fail
+  // under `dafny test`/`dafny build` even though every piece verified fine in isolation
+  // under `dafny verify` - so this shape is kept for the KCopies-based replacement too.
+  lemma {:timeLimitMultiplier 8} KCopiesOfRunAcceptsFromWalk(g: Graph, v: int, walk: seq<int>, splits: seq<nat>, w: string, k: int)
     requires WF(g)
     requires v in g.nodes
-    requires !Matches(g.labels[v], "")
     requires StepsOk(g, walk, splits, w)
     requires 0 < k <= |walk|
     requires forall i :: 0 <= i < k ==> walk[i] == v
     ensures splits[0] <= splits[k] <= |w|
-    ensures Matches(Plus(g.labels[v]), w[splits[0]..splits[k]])
+    ensures MatchesKCopies(g.labels[v], w[splits[0]..splits[k]], k)
   {
     var run := walk[..k];
     var runSplits := splits[..k + 1];
@@ -5029,15 +5288,16 @@ module BigramGraph {
     assert runSplits[0] <= |w| by {
       StepsOkAt(g, walk, splits, w, 0);
     }
-    SplitsOkImpliesForall(g, run, runSplits, w);
-    PlusOfRunAccepts(g, v, run, runSplits, w);
+    KCopiesOfRunAccepts(g, v, run, runSplits, w);
     assert w[splits[0]..splits[k]] == w[runSplits[0]..runSplits[k]];
   }
 
-  lemma LoopStepsPreserves(g: Graph, v: int, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
+  lemma LoopStepsPreserves(g: Graph, v: int, c: char, maxRun: nat, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    requires g' == LoopToPlusGraph(g, v)
+    requires g.labels[v] == Sym(c)
+    requires LongestRun(w, c) <= maxRun
+    requires g' == LoopToPlusGraph(g, v, maxRun)
     requires ValidSteps(g, walk)
     requires StepsOk(g, walk, splits, w)
     ensures WF(g')
@@ -5050,16 +5310,18 @@ module BigramGraph {
     if |walk| == 0 {
       // ValidSteps requires |walk| >= 1, so this case is vacuous.
     } else if walk[0] != v {
-      LoopStepsPreservesUntouched(g, v, g', walk, splits, w);
+      LoopStepsPreservesUntouched(g, v, c, maxRun, g', walk, splits, w);
     } else {
-      LoopStepsPreservesRun(g, v, g', walk, splits, w);
+      LoopStepsPreservesRun(g, v, c, maxRun, g', walk, splits, w);
     }
   }
 
-  lemma LoopStepsPreservesUntouched(g: Graph, v: int, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
+  lemma LoopStepsPreservesUntouched(g: Graph, v: int, c: char, maxRun: nat, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    requires g' == LoopToPlusGraph(g, v)
+    requires g.labels[v] == Sym(c)
+    requires LongestRun(w, c) <= maxRun
+    requires g' == LoopToPlusGraph(g, v, maxRun)
     requires ValidSteps(g, walk)
     requires StepsOk(g, walk, splits, w)
     requires |walk| >= 1 && walk[0] != v
@@ -5070,7 +5332,7 @@ module BigramGraph {
     ensures CollapseSplits(walk, splits, {v}, v)[|CollapseRuns(walk, {v}, v)|] == splits[|walk|]
     decreases |walk|, 0
   {
-    LoopToPlusWF(g, v);
+    LoopToPlusWF(g, v, maxRun);
     var C := {v};
     var walk' := CollapseRuns(walk, C, v);
     var splits' := CollapseSplits(walk, splits, C, v);
@@ -5110,7 +5372,7 @@ module BigramGraph {
           assert restWalk[i] == walk[i + 1] && restWalk[i + 1] == walk[i + 2];
         }
       }
-      LoopStepsPreserves(g, v, g', restWalk, restSplits, w);
+      LoopStepsPreserves(g, v, c, maxRun, g', restWalk, restSplits, w);
       var restWalk' := CollapseRuns(restWalk, C, v);
       var restSplits' := CollapseSplits(restWalk, restSplits, C, v);
       assert walk' == [walk[0]] + restWalk';
@@ -5154,10 +5416,52 @@ module BigramGraph {
     }
   }
 
-  lemma {:timeLimitMultiplier 100} LoopStepsPreservesRun(g: Graph, v: int, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
+  // Bundles "run KCopiesOfRunAcceptsFromWalk, unfold the Sym(c) run it produces back to a
+  // literal run of c's, bound its length by LongestRun/maxRun, then invoke
+  // MatchesKCopiesImpliesRepRange" into its own separate, minimal lemma - exactly the same
+  // "isolate a fragile multi-step derivation into its own small lemma" mitigation this
+  // file already uses throughout (PlusOfRunAcceptsFromWalk's own original reason for
+  // existing, StepsOkPrepend, StepsOkSuffix, etc.): inlining all of this directly into
+  // LoopStepsPreservesRun's own body was empirically confirmed to bloat that lemma's
+  // local proof context enough to destabilize an unrelated, PRE-EXISTING assertion further
+  // down in the very same method under `dafny test`/`dafny build` specifically (the
+  // "sensitive to the overall proof/lemma population of the file, not specific to
+  // anything this round added" instability this file's own module header already
+  // documents) - keeping LoopStepsPreservesRun's own body close to its original size
+  // avoids that.
+  lemma RepRangeOfRunAcceptsFromWalk(g: Graph, v: int, c: char, maxRun: nat, walk: seq<int>, splits: seq<nat>, w: string, k: int)
+    requires WF(g)
+    requires v in g.nodes
+    requires g.labels[v] == Sym(c)
+    requires LongestRun(w, c) <= maxRun
+    requires StepsOk(g, walk, splits, w)
+    requires 0 < k <= |walk|
+    requires forall i :: 0 <= i < k ==> walk[i] == v
+    ensures splits[0] <= splits[k] <= |w|
+    ensures Matches(RepRange(g.labels[v], 1, maxRun), w[splits[0]..splits[k]])
+  {
+    KCopiesOfRunAcceptsFromWalk(g, v, walk, splits, w, k);
+    var runStr := w[splits[0]..splits[k]];
+    assert MatchesKCopies(g.labels[v], runStr, k);
+    assert MatchesKCopies(Sym(c), runStr, k);
+    KCopiesSymAllC(c, runStr, k);
+    assert |runStr| == k;
+    assert splits[k] - splits[0] == k;
+    forall i | splits[0] <= i < splits[k] ensures w[i] == c {
+      assert w[i] == runStr[i - splits[0]];
+    }
+    LongestRunLowerBoundAt(w, c, splits[0], splits[k]);
+    assert LongestRun(w, c) >= splits[k] - splits[0];
+    assert k <= maxRun;
+    MatchesKCopiesImpliesRepRange(g.labels[v], 1, maxRun, k, runStr);
+  }
+
+  lemma {:timeLimitMultiplier 100} LoopStepsPreservesRun(g: Graph, v: int, c: char, maxRun: nat, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    requires g' == LoopToPlusGraph(g, v)
+    requires g.labels[v] == Sym(c)
+    requires LongestRun(w, c) <= maxRun
+    requires g' == LoopToPlusGraph(g, v, maxRun)
     requires ValidSteps(g, walk)
     requires StepsOk(g, walk, splits, w)
     requires |walk| >= 1 && walk[0] == v
@@ -5168,7 +5472,7 @@ module BigramGraph {
     ensures CollapseSplits(walk, splits, {v}, v)[|CollapseRuns(walk, {v}, v)|] == splits[|walk|]
     decreases |walk|, 0
   {
-    LoopToPlusWF(g, v);
+    LoopToPlusWF(g, v, maxRun);
     var C := {v};
     var walk' := CollapseRuns(walk, C, v);
     var splits' := CollapseSplits(walk, splits, C, v);
@@ -5180,16 +5484,18 @@ module BigramGraph {
     assert afterRun == walk[k..];
     SkipCSplitsIsSuffix(walk, splits, C);
     assert afterSplits == splits[k..];
-    // Routed through the dedicated PlusOfRunAcceptsFromWalk lemma (see its own comment)
-    // rather than inline "slice run/runSplits off walk/splits, establish
-    // PlusOfRunAccepts's precondition, call it" code - the inline form verified fine
-    // under `dafny verify` but was empirically confirmed to still intermittently fail
-    // under `dafny test`/`dafny build` specifically.
+    // Routed through the dedicated RepRangeOfRunAcceptsFromWalk lemma (see its own
+    // comment, and its superseded PlusOfRunAcceptsFromWalk predecessor's) rather than
+    // inline "slice run/runSplits off walk/splits, establish the precondition, call it"
+    // code - the inline form verified fine under `dafny verify` but was empirically
+    // confirmed to still intermittently fail under `dafny test`/`dafny build`
+    // specifically.
     forall i | 0 <= i < k ensures walk[i] == v {
       assert walk[i] in C;
     }
-    PlusOfRunAcceptsFromWalk(g, v, walk, splits, w, k);
-    assert g'.labels[v] == Plus(g.labels[v]);
+    RepRangeOfRunAcceptsFromWalk(g, v, c, maxRun, walk, splits, w, k);
+    assert g'.labels[v] == RepRange(g.labels[v], 1, maxRun);
+    assert Matches(g'.labels[v], w[splits[0]..splits[k]]);
 
     if |afterRun| == 0 {
       assert walk' == [v] + CollapseRuns(afterRun, C, v);
@@ -5237,7 +5543,7 @@ module BigramGraph {
       assert afterRun == walk[k..] && afterSplits == splits[k..];
       StepsOkSuffix(g, walk, splits, w, k);
       assert StepsOk(g, afterRun, afterSplits, w);
-      LoopStepsPreserves(g, v, g', afterRun, afterSplits, w);
+      LoopStepsPreserves(g, v, c, maxRun, g', afterRun, afterSplits, w);
       var afterWalk' := CollapseRuns(afterRun, C, v);
       var afterSplits' := CollapseSplits(afterRun, afterSplits, C, v);
       assert walk' == [v] + afterWalk';
@@ -5261,10 +5567,10 @@ module BigramGraph {
       }
       // Routed through StepsOkPrepend (see its own comment) instead of an inline
       // `assert StepsOk(...) by { forall ... }` block re-deriving the same "cons the
-      // v step (already known, via PlusOfRunAccepts above, to accept the whole
-      // Plus-run) onto the recursively-obtained StepsOk witness for the rest" shape -
-      // even this already fairly hardened form (rebinding lo/hi and calling
-      // StepsOkAt) started failing under the new Regex datatype; confirmed via
+      // v step (already known, via KCopiesOfRunAcceptsFromWalk/MatchesKCopiesImpliesRepRange
+      // above, to accept the whole run) onto the recursively-obtained StepsOk witness for
+      // the rest" shape - even this already fairly hardened form (rebinding lo/hi and
+      // calling StepsOkAt) started failing under the new Regex datatype; confirmed via
       // `--isolate-assertions --filter-position` to be a batch-context instability
       // (every assertion here verifies fine on its own), not a genuinely false goal.
       assert v in g'.nodes;
@@ -5276,17 +5582,19 @@ module BigramGraph {
     }
   }
 
-  lemma LoopToPlusSound(g: Graph, v: int, w: string)
+  lemma LoopToPlusSound(g: Graph, v: int, c: char, maxRun: nat, w: string)
     requires WF(g)
     requires AllLabelsSore(g)
     requires PairwiseDisjointLabels(g)
     requires CanLoopToPlus(g, v)
+    requires g.labels[v] == Sym(c)
+    requires LongestRun(w, c) <= maxRun
     requires GraphAccepts(g, w)
-    ensures WF(LoopToPlusGraph(g, v))
-    ensures GraphAccepts(LoopToPlusGraph(g, v), w)
+    ensures WF(LoopToPlusGraph(g, v, maxRun))
+    ensures GraphAccepts(LoopToPlusGraph(g, v, maxRun), w)
   {
-    var g' := LoopToPlusGraph(g, v);
-    LoopToPlusWF(g, v);
+    var g' := LoopToPlusGraph(g, v, maxRun);
+    LoopToPlusWF(g, v, maxRun);
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
     // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
     // extraction - the latter started failing to establish existence here under the new
@@ -5297,7 +5605,7 @@ module BigramGraph {
       forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
       }
     }
-    LoopStepsPreserves(g, v, g', walk, splits, w);
+    LoopStepsPreserves(g, v, c, maxRun, g', walk, splits, w);
     var walk' := CollapseRuns(walk, {v}, v);
     var splits' := CollapseSplits(walk, splits, {v}, v);
     assert walk[0] == g.start && walk[0] != v;
@@ -5328,32 +5636,37 @@ module BigramGraph {
 
   // ---- Executable builder (no fresh node needed, exactly like ExecMakeOptional) ----
 
-  method ExecLoopToPlus(g: Graph, v: int) returns (g2: Graph)
+  method ExecLoopToPlus(g: Graph, v: int, maxRun: nat) returns (g2: Graph)
     requires WF(g)
     requires CanLoopToPlus(g, v)
-    ensures g2 == LoopToPlusGraph(g, v)
+    ensures g2 == LoopToPlusGraph(g, v, maxRun)
   {
-    var labels' := g.labels[v := Plus(g.labels[v])];
+    var labels' := g.labels[v := RepRange(g.labels[v], 1, maxRun)];
     g2 := Graph(g.nodes, labels', g.edges - {(v, v)}, g.start, g.end);
   }
 
-  // ---- Executable search: the first node with a (non-nullable-labeled) self-loop ----
+  // ---- Executable search: the first node with a (non-nullable, bare-Sym-labeled)
+  // self-loop - also returns the symbol c itself (g.labels[v] == Sym(c)), needed by the
+  // caller to compute maxRun := MaxRunOverSet(S, c) before building the new graph. ----
 
-  method FindSelfLoopNode(g: Graph) returns (found: bool, v: int)
+  method FindSelfLoopNode(g: Graph) returns (found: bool, v: int, c: char)
     requires WF(g)
-    ensures found ==> CanLoopToPlus(g, v)
+    ensures found ==> CanLoopToPlus(g, v) && g.labels[v] == Sym(c)
   {
     found := false;
     v := 0;
+    c := ' ';
     var xs := SetToSeqExec(g.nodes);
     var i := 0;
     while i < |xs| && !found
       invariant 0 <= i <= |xs|
-      invariant found ==> CanLoopToPlus(g, v)
+      invariant found ==> CanLoopToPlus(g, v) && g.labels[v] == Sym(c)
     {
-      if xs[i] != g.start && xs[i] != g.end && (xs[i], xs[i]) in g.edges && !Matches(g.labels[xs[i]], "") {
+      if xs[i] != g.start && xs[i] != g.end && (xs[i], xs[i]) in g.edges &&
+         !Matches(g.labels[xs[i]], "") && g.labels[xs[i]].Sym? {
         found := true;
         v := xs[i];
+        c := g.labels[xs[i]].c;
       }
       i := i + 1;
     }
@@ -5361,7 +5674,7 @@ module BigramGraph {
 
   // ---- Loop-body lemma, matching LoopStepSimplePath/…MergeAny/…MakeOptional's shape ----
 
-  lemma LoopStepLoopToPlus(oldG: Graph, v: int, S: set<string>, g: Graph)
+  lemma LoopStepLoopToPlus(oldG: Graph, v: int, c: char, maxRun: nat, S: set<string>, g: Graph)
     requires WF(oldG)
     requires AllLabelsSore(oldG)
     requires PairwiseDisjointLabels(oldG)
@@ -5370,7 +5683,9 @@ module BigramGraph {
     requires oldG.labels[oldG.end] == Eps
     requires forall w :: w in S ==> GraphAccepts(oldG, w)
     requires CanLoopToPlus(oldG, v)
-    requires g == LoopToPlusGraph(oldG, v)
+    requires oldG.labels[v] == Sym(c)
+    requires forall w :: w in S ==> LongestRun(w, c) <= maxRun
+    requires g == LoopToPlusGraph(oldG, v, maxRun)
     ensures WF(g)
     ensures AllLabelsSore(g)
     ensures PairwiseDisjointLabels(g)
@@ -5381,14 +5696,14 @@ module BigramGraph {
     ensures InteriorNodes(g) == InteriorNodes(oldG)
     ensures |g.edges| < |oldG.edges|
   {
-    LoopToPlusAllLabelsSore(oldG, v);
-    LoopToPlusPairwiseDisjoint(oldG, v);
-    LoopToPlusNoBackEdges(oldG, v);
-    LoopToPlusSentinels(oldG, v);
-    InteriorNodesLoopToPlus(oldG, v);
-    EdgeCountLoopToPlus(oldG, v);
+    LoopToPlusAllLabelsSore(oldG, v, maxRun);
+    LoopToPlusPairwiseDisjoint(oldG, v, maxRun);
+    LoopToPlusNoBackEdges(oldG, v, maxRun);
+    LoopToPlusSentinels(oldG, v, maxRun);
+    InteriorNodesLoopToPlus(oldG, v, maxRun);
+    EdgeCountLoopToPlus(oldG, v, maxRun);
     forall w | w in S ensures GraphAccepts(g, w) {
-      LoopToPlusSound(oldG, v, w);
+      LoopToPlusSound(oldG, v, c, maxRun, w);
     }
   }
 
@@ -6088,11 +6403,12 @@ module BigramGraph {
         g := ExecContractSimplePath(oldG, x, y);
         LoopStepSimplePath(oldG, x, y, S, g);
       } else {
-        var foundLoop, vLoop := FindSelfLoopNode(g);
+        var foundLoop, vLoop, cLoop := FindSelfLoopNode(g);
         if foundLoop {
           var oldG := g;
-          g := ExecLoopToPlus(oldG, vLoop);
-          LoopStepLoopToPlus(oldG, vLoop, S, g);
+          var maxRun := MaxRunOverSet(S, cLoop);
+          g := ExecLoopToPlus(oldG, vLoop, maxRun);
+          LoopStepLoopToPlus(oldG, vLoop, cLoop, maxRun, S, g);
         } else {
           var foundExact, aExact, bExact := FindExactMergePair(g);
           if foundExact {

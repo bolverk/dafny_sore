@@ -210,10 +210,24 @@ module GraphTests {
   // CollapseAllGraph and wildcarded the ENTIRE remaining interior (including the
   // completely unrelated 'a'/'x'/'y' nodes) into Star(Union(Union(Union(Sym('a'),Sym('x')),
   // Sym('y')),Sym('b'))) - i.e. [axyb]*, wrongly accepting "a" alone, "x" alone, and "abbx"
-  // (mixing 'a' with 'bb'). After Round 9, InferViaBigramGraph produces
+  // (mixing 'a' with 'bb'). After Round 9, InferViaBigramGraph produced
   // Concat(Union(Sym('a'),Plus(Sym('b'))),Union(Sym('x'),Plus(Sym('y')))) - i.e.
-  // (a|b+)(x|y+) - confirmed empirically (see Graph.dfy's Round 9 header comment) - which
-  // still accepts every sample but correctly rejects "a", "x" and "abbx".
+  // (a|b+)(x|y+) - which still accepted every sample but correctly rejected "a", "x" and
+  // "abbx".
+  //
+  // Round 12 tightens this further: Plus's unbounded "one or more" is replaced with the
+  // tightest RepRange bound the input actually justifies - RepRange(Sym('b'),1,2) (the
+  // longest run of 'b' across the input, from "bbx"/"bbyyy", is 2) and
+  // RepRange(Sym('y'),1,3) (the longest run of 'y', from "ayyy", is 3) - so
+  // InferViaBigramGraph now produces
+  // Concat(Union(Sym('a'),RepRange(Sym('b'),1,2)),Union(Sym('x'),RepRange(Sym('y'),1,3))) -
+  // i.e. (a|b{1,2})(x|y{1,3}). The two new `!Matches` assertions below ("bbbx"/"ayyyy", one
+  // more repetition of 'b'/'y' than any sample ever showed) are the ones this round adds -
+  // under the old unbounded Plus these were WRONGLY accepted (that was the very
+  // over-generalization RepRange fixes), so they could not have been asserted as
+  // rejections before; every original sample's acceptance (and the "a"/"x"/"abbx"
+  // rejections Round 9 already established) is kept unchanged, confirming this is a
+  // strict tightening, not a behavior change.
   method {:test} TestSelfLoopToPlusTightening() {
     var r := CheckOneSet({"ax", "ayyy", "bbx", "bbyyy"}, "ax/ayyy/bbx/bbyyy self-loop-to-Plus tightening");
     expect Matches(r, "ax");
@@ -223,6 +237,56 @@ module GraphTests {
     expect !Matches(r, "a");
     expect !Matches(r, "x");
     expect !Matches(r, "abbx");
+    // ROUND 12: one more repetition of the self-looped character than any sample ever
+    // showed - correctly rejected now that Plus's unbounded "one or more" has been
+    // tightened to RepRange(_, 1, maxRun).
+    expect !Matches(r, "bbbx");
+    expect !Matches(r, "ayyyy");
+  }
+
+  // ---- ROUND 12 fuzz-style coverage: sweeps several more "shapes" of repeated-character
+  // input (varying run lengths, alphabets, and surrounding context) beyond the one worked
+  // example above, checking for each one that (1) every input sample is still accepted and
+  // (2) a probe built with "one more repetition of the self-looped character than the
+  // computed bound allows" (in a context that would otherwise fit the pattern) is
+  // correctly REJECTED - confirming the RepRange bound InferViaBigramGraph computes is
+  // genuinely tight, not merely some bound that happens to be large enough. Each case's
+  // surrounding context (anchor characters before/after the repeated run) was checked
+  // empirically to resolve via the self-loop-to-Plus/RepRange path this round changes,
+  // not via SCC-contraction or CollapseAllGraph (both still emit an unbounded Star - out
+  // of scope for this round, see Graph.dfy's own header comment - so a probe against
+  // those would not actually confirm tightness). ----
+
+  method CheckSelfLoopBoundTight(S: set<string>, caseName: string, probeAccept: seq<string>, probeReject: seq<string>)
+  {
+    var r := CheckOneSet(S, caseName);
+    var accepted := CheckAllAccepted(r, probeAccept);
+    expect accepted, "fuzz case '" + caseName + "': an expected-accept probe was rejected";
+    var i := 0;
+    while i < |probeReject|
+      invariant 0 <= i <= |probeReject|
+    {
+      expect !Matches(r, probeReject[i]),
+        "fuzz case '" + caseName + "': probe '" + probeReject[i] +
+        "' should have been rejected (one more repetition than the computed bound allows) but was accepted";
+      i := i + 1;
+    }
+  }
+
+  method {:test} TestSelfLoopFuzzVariousRunLengths() {
+    // Longest run of 'a' is 3 (from "aaac"); one more ('a' x4) must be rejected.
+    CheckSelfLoopBoundTight({"ac", "aac", "aaac"}, "fuzz: longest run of a is 3",
+      ["ac", "aac", "aaac"], ["aaaac"]);
+    // Longest run of 'b' is 4 (from "wbbbbz"); one more ('b' x5) must be rejected.
+    CheckSelfLoopBoundTight({"wbz", "wbbz", "wbbbbz"}, "fuzz: longest run of b is 4",
+      ["wbz", "wbbz", "wbbbbz"], ["wbbbbbz"]);
+    // Longest run of 'p' is 4 (from "qppppr"), alongside optional 'q'/'r' anchors and an
+    // unrelated single-symbol alternative "m"; one more ('p' x5) must be rejected.
+    CheckSelfLoopBoundTight({"m", "pp", "qppppr"}, "fuzz: longest run of p is 4 with optional anchors",
+      ["m", "pp", "qppppr"], ["qpppppr"]);
+    // Longest run of 'y' is 6 (from "xyyyyyy"); one more ('y' x7) must be rejected.
+    CheckSelfLoopBoundTight({"xyy", "xyyyyyy"}, "fuzz: longest run of y is 6",
+      ["xyy", "xyyyyyy"], ["xyyyyyyy"]);
   }
 
   // Distinguishes Graph.dfy's Round 11 (topological chain-wrap, replacing CollapseAllGraph
