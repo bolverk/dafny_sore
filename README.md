@@ -54,12 +54,15 @@ certifying algorithm" below for what that means):
 2. **Periodic block, with an optional per-position choice** — when the whole component
    is (or reduces to) repetitions of some period `p`, where each of the `p` positions
    *within one repetition* may itself be a choice among several characters, not just a
-   fixed literal — e.g. `{"abab"}` → `(ab)+`, `{"ab","abab","ababab"}` → the same `(ab)+`
-   (every position's alphabet happens to be a singleton, reducing to the literal case),
-   and `{"abab","acac"}` (period 2, position 0 always `a`, position 1 either `b` or `c`)
-   → `(?:a(?:b|c))+` rather than a full wildcard over `{a,b,c}`.
-3. **Wildcard** — `Star(a1|a2|...|an)` over *that component's* alphabet only, always
-   sound and always single-occurrence, used whenever none of the above applies.
+   fixed literal — e.g. `{"abab"}` → `(?:ab){1,2}`, `{"ab","abab","ababab"}` →
+   `(?:ab){1,3}` (every position's alphabet happens to be a singleton, reducing to the
+   literal case; the upper bound is however many repetitions the longest sample actually
+   needs), and `{"abab","acac"}` (period 2, position 0 always `a`, position 1 either `b`
+   or `c`) → `(?:a[bc]){1,2}` rather than a full wildcard over `{a,b,c}`. The `{lo,hi}`
+   bound is not the old unbounded `+` — see "Bounded repetition" below.
+3. **Wildcard** — `RepRange(a1|a2|...|an, 0, maxLen)` over *that component's* alphabet
+   only, `maxLen` being the longest sample's length, always sound and always
+   single-occurrence, used whenever none of the above applies.
 
 ## Files
 
@@ -74,11 +77,15 @@ certifying algorithm" below for what that means):
   - the periodic-block-with-choice building block (tier 2): `BlockPieces(Sigmas)` builds
     a regex for one repetition of the block from a list of per-position character sets
     (`UnionAll(Sigmas[i])` at each position `i`, reducing to a plain literal when
-    `Sigmas[i]` is a singleton); `FitsPeriodChoice`/`FitsPeriodChoiceSound` decide whether
-    a string is exactly `p` characters repeated some positive number of times with each
-    repetition's `i`-th character drawn from `Sigmas[i]` (re-checked independently at
-    every repetition, not assumed identical across them) and prove that
-    `Plus(BlockPieces(Sigmas))` is sound for such strings; `PeriodicChoiceIsSore` proves
+    `Sigmas[i]` is a singleton); `FitsPeriodChoice` decides whether a string is exactly `p`
+    characters repeated some positive number of times with each repetition's `i`-th
+    character drawn from `Sigmas[i]` (re-checked independently at every repetition, not
+    assumed identical across them), and `FitsPeriodChoiceKCopies` proves such a string
+    decomposes into exactly `PeriodRepCount(t, p)` copies of `BlockPieces(Sigmas)`
+    (`MatchesKCopies`), which `Infer.dfy` folds into a tight per-component bound
+    (`MaxKForPeriod`/`MaxKForPeriodBound`) and bridges to a bounded
+    `RepRange(BlockPieces(Sigmas), 1, maxK)` via `MatchesKCopiesImpliesRepRange`
+    (`Regex.dfy`) — see "Bounded repetition" below; `PeriodicChoiceIsSore` proves
     single-occurrence given every `Sigmas[i]` is itself duplicate-free
     (`SigmasNoDupBound`) and no character is shared *across* two different positions
     (`SigmasPairwiseDisjoint`/`SeqDisjoint`) — this cross-position disjointness is the one
@@ -91,9 +98,13 @@ certifying algorithm" below for what that means):
     single-occurrence proof), and the heuristic slot-builder `BuildSlots` (with its own
     symbol-preservation proof `BuildSlotsAtSymbols`, but no other correctness burden —
     see "Design: a certifying algorithm");
-  - `UnionAll`/`UnionAllSound`/`UnionAllIsSore`/`UnionStarSound` — the wildcard (tier 3)
-    building block, also reused by `SChoice` slots for a mandatory/optional choice among
-    several mutually-exclusive symbols;
+  - `UnionAll`/`UnionAllSound`/`UnionAllIsSore` — the wildcard (tier 3) building block,
+    also reused by `SChoice` slots for a mandatory/optional choice among several
+    mutually-exclusive symbols; `UnionKCopies` proves a string of length `k` decomposes
+    into exactly `k` one-character copies of `UnionAll(cs)`, which `Infer.dfy` folds into
+    a tight per-component bound (`MaxLen`/`MaxLenBound`, the longest sample's length) and
+    bridges to a bounded `RepRange(UnionAll(cs), 0, maxLen)` the same way tier 2 does —
+    see "Bounded repetition" below;
   - two small pieces still needed for tier 0's literal prefix/suffix (`ConcatLiteral(P)`/
     `ConcatLiteral(Q)`) even though tier 0 itself is defined in `Infer.dfy` and recurses
     rather than building a flat literal alternation here: `NoDupConcatDisjoint` ("no
@@ -150,8 +161,10 @@ certifying algorithm" below for what that means):
       `BuildSigmas`); a checker that verifies the period and per-position alphabets
       together cover every sample (`CheckPeriodChoiceAll`) *and* that the alphabets are
       pairwise disjoint across positions (`SigmasPairwiseDisjoint`);
-    - tier 3: the always-sound `Star(a1|a2|...|an)` wildcard fallback (`UnionAll` +
-      `UnionStarSound`) over that component's own alphabet (`AlphabetAll`);
+    - tier 3: the always-sound wildcard fallback over that component's own alphabet
+      (`AlphabetAll`), bounded rather than unbounded — `RepRange(UnionAll(cs), 0, maxLen)`
+      via `UnionKCopies` + `MaxLen` (`Chain.dfy`) and `MatchesKCopiesImpliesRepRange`
+      (`Regex.dfy`) — see "Bounded repetition" below;
   - `InferGroupPositionalSplit` (tried between tier 0 and tier 1): tries a front-alphabet
     split first — `Sigma1 := FrontAlphabet(strs)` (every character ever seen as some
     sample's first character), `MaximalPrefixInSet`/`TakeFrontRun`/`DropFrontRun` split
@@ -505,6 +518,115 @@ datatype constructors with their own `Matches` and `Symbols` cases, matching how
 SORE literature actually treats `?`, `*`, `+` as unary postfix operators on an
 already-single-occurrence sub-expression, not desugared syntax.
 
+## Bounded repetition
+
+Every repetition site in both implementations originally used unbounded `Star`/`Plus`:
+sound (any finite sample set is still accepted, since `Star`/`Plus` accept everything a
+tighter bound would, plus more), but needlessly loose. `{"aabbc","abbbc"}` never shows
+more than two `a`s or three `b`s in a row, yet the unbounded construction inferred
+`a+b+c` — accepting `"aaaaaaab...c"` and every other run length, none of it justified by
+the samples. A finite sample set only ever justifies a finite range of repetition
+counts, so a regex that reports the *actual* observed range is strictly more useful
+(and no less sound) than one that shrugs and allows anything.
+
+`RepRange(r, lo, hi)` is the primitive added to close this gap: it matches `s` iff `s`
+splits into exactly `k` consecutive pieces each matching `r`, for some `lo <= k <= hi`
+— formalized as `MatchesKCopies(r, s, k)` (an explicit "one piece at a time" splitting
+predicate) together with a bridge lemma, `MatchesKCopiesImpliesRepRange`, that turns any
+concrete `MatchesKCopies(r, s, k)` witness with `lo <= k <= hi` into a proof that
+`Matches(RepRange(r, lo, hi), s)`. Every bounded-repetition call site in this project
+follows the same recipe: compute a per-instance `k` (how many copies a given sample
+actually needs), compute a bound (`lo`/`hi`) that is guaranteed to cover every sample's
+own `k`, and invoke the bridge lemma. Like `Opt`/`Plus` (see above), `RepRange` is its
+own datatype constructor rather than a macro over `Star`/`Concat` — `Symbols(RepRange(r,
+lo, hi)) == Symbols(r)`, counting `r`'s symbols exactly once regardless of `lo`/`hi`, so
+wrapping something in `RepRange` never multiplies its symbol count and never breaks
+`IsSore`. Desugaring it (e.g. as `k` copies of `r` concatenated together) would count
+`r`'s symbols `k` times over, exactly the bug `Opt`/`Plus`-as-macros would have had.
+
+Both implementations replaced every repetition site with a tight bound computed from the
+actual sample set; each conversion is proved sound via Dafny and cross-checked with fuzz
+tests confirming both that every sample is still accepted and that a probe needing one
+more repetition than the computed bound is correctly rejected.
+
+### In the tiered implementation (`Chain.dfy`/`Infer.dfy`)
+
+- **Tier 1's plain per-position chain and choice-slot construction** now wrap each
+  position in `RepRange(Sym(c), lo, MaxRunHere(strs, c))` instead of unbounded
+  `Opt(Plus(Sym(c)))`/`Plus(Sym(c))`, where `MaxRunHere(strs, c)` is the longest run of
+  `c` observed at that position across the whole batch, and `lo` is 0 or 1 depending on
+  whether the position is mandatory. This is a genuinely **per-position** bound, not one
+  shared constant — `{"aabbc","abbbc"}` gives `a` and `b` two independently-tight limits:
+
+  ```
+  python3 ./sore.py aabbc abbbc
+  # a{1,2}b{1,3}c        (was a+b+c before this round)
+  ```
+
+- **Tier 2 (periodic block)** wraps the repeated block in `RepRange(BlockPieces(Sigmas),
+  1, maxK)`, where `maxK` is the largest repetition count actually observed across the
+  component's own samples (`MaxKForPeriod`):
+
+  ```
+  python3 ./sore.py abab acac
+  # (?:a[bc]){1,2}        (was (?:a(?:b|c))+ before this round)
+  ```
+
+- **Tier 3 (wildcard fallback)**, used for symbols that genuinely conflict or whose
+  order can't be pinned down, wraps the union in `RepRange(UnionAll(cs), 0, maxLen)`,
+  where `maxLen` is the longest sample's length (`MaxLen`):
+
+  ```
+  python3 ./sore.py abab abc xab
+  # [abcx]{0,4}        (was [cbax]* before this round)
+  ```
+
+### In the bigram-graph implementation (`Graph.dfy`)
+
+- **Self-loop contraction** (a single-character node with an edge back to itself, e.g.
+  from repeated-character input) wraps the label in `RepRange(Sym(c), 1, maxRun)`, where
+  `maxRun` is the longest consecutive run of `c` across every input sample
+  (`MaxRunOverSet`):
+
+  ```
+  python3 ./sore_bigram.py xaa xaaaa
+  # xa{1,4}        (was xa+ before this round)
+  ```
+
+- **SCC-contraction and whole-graph collapse** (contracting a genuine cycle of two or
+  more nodes, or, as a last resort, the entire remaining graph) wrap the unioned labels
+  in `RepRange(UnionAllLabels(g, cs), 0, maxLen)`, where `maxLen` is the longest input
+  sample's length (`MaxLenOverSet`):
+
+  ```
+  python3 ./sore_bigram.py xab xba
+  # x[ab]{0,3}        (was x[ab]* before this round)
+  ```
+
+**A subtlety found while bounding SCC contraction.** The straightforward argument for a
+repetition bound is "every repetition consumes at least one character, so a string of
+length `n` can't need more than `n` repetitions." That argument breaks for SCC
+contraction specifically: a genuine cycle's members can include a node whose label is
+already nullable (e.g. an `Opt` folded in by an earlier, separate contraction step), so
+one "repetition" of the contracted block can legitimately consume zero characters, and
+naively bounding the repeat count by string length would be unsound. The fix is a
+lemma, `CompressKCopies`, that strips the zero-length pieces out of any
+`MatchesKCopies` witness first, producing an equivalent witness whose repeat count is
+bounded by the string's length regardless of how many (if any) of the original pieces
+were nullable — so the `maxLen` bound holds unconditionally, not just for the
+non-nullable case the naive argument would have covered.
+
+**Nesting needs no special case.** The bigram-graph algorithm tries self-loop contraction
+before SCC-contraction/whole-graph collapse, so a node already rewritten to
+`RepRange(Sym(c), 1, maxRun)` by an earlier self-loop step can end up folded — via
+`UnionAllLabels` — into a *later* SCC or whole-graph contraction's own
+`RepRange(UnionAllLabels(g, cs), 0, maxLen)`, nesting one bounded repetition inside
+another. This needed no extra machinery: each `RepRange` site's bound (`maxRun`,
+`maxLen`, `maxK`, ...) is computed straight from the original top-level sample set (or the
+relevant substrings of it), never from assumptions about what its own argument `r` looks
+like internally, so an outer bound stays correct regardless of how tight or loose the
+inner one already is.
+
 ## Why `Infer` is a `method`, not a `function`
 
 Converting the input `set<string>` into a concrete processing order requires an
@@ -728,10 +850,11 @@ sample alone containing both an `"ab"`-repetition and an `"ac"`-repetition of th
 period, rather than the variation only ever showing up as a difference *between*
 samples) can cause the certifying check to reject that period even though a per-position
 choice covering it does exist — again, safe (falls through to the wildcard), just not as
-tight as possible. Finally, `Plus` only ever produces "one or more" repetitions
-(`(ab)+`), never an exact bounded count like `(ab){2}` — that would need a new primitive
-`Rep(r, n)` constructor with its own `Matches`/`IsSore` cases, deliberately out of scope
-here (`(ab)+` is strictly sound, just not as tight as an exact count).
+tight as possible. (An earlier version of this section noted that `Plus` only ever
+produces "one or more" repetitions, never an exact bounded range like `(ab){1,2}`, and
+that fixing this would need a new bounded-repetition constructor, deliberately out of
+scope at the time — that constructor (`RepRange`) has since been added and is now what
+tier 2 actually emits; see "Bounded repetition" below.)
 
 Module names (`RegexCore`, `SoreInfer`) are distinct from their main datatype/method
 names (`Regex`, `Infer`) because Dafny's JavaScript backend silently misbehaves at
@@ -762,7 +885,7 @@ dafny test --target:js src/Tests.dfy
 
 ```sh
 python3 ./sore.py abab abc xab
-# [cbax]*
+# [abcx]{0,4}
 python3 ./sore.py abc adc
 # a[bd]c
 python3 ./sore.py cat car cab
@@ -777,7 +900,8 @@ It prints one line: a Python `re`-compatible regex that is sound for the given
 space-separated arguments and single-occurrence, per `Infer`'s proved theorems. A
 `Union` of nothing but `Sym` leaves (any nesting) prints as a bracket character class
 (`[bd]`) rather than a `(?:b|d)` alternation, since that's what such a union actually
-is — including the tier-3 wildcard itself (`(a|b|c)*` prints as `[abc]*`). Anything
+is — including the tier-3 wildcard itself (`RepRange(a|b|c, 0, n)` prints as `[abc]{0,n}`).
+Anything
 else that needs grouping (a `Union` containing a `Concat`/`Star`/etc., or as the operand
 of `Concat`/`Star`/`Plus`/`Opt`) still gets `(?:...)`.
 
@@ -833,9 +957,10 @@ python3 ./sore_bigram.py B C BC
 python3 ./sore_bigram.py abc adc
 # a[bd]c
 python3 ./sore_bigram.py abab
-# [ab]*    (sound, but looser than sore.py's (?:ab)+ — see "Known limitations" in
-#           Graph.dfy's header: the bigram-graph algorithm's only repetition
-#           mechanism, SCC contraction, is inherently order-blind for genuine cycles)
+# [ab]{0,4}    (sound, but looser than sore.py's (?:ab){1,2} — see "Known limitations" in
+#               Graph.dfy's header: the bigram-graph algorithm's only repetition
+#               mechanism, SCC contraction, is inherently order-blind for genuine cycles.
+#               The {0,4} bound itself is tight, not unbounded — see "Bounded repetition".)
 ```
 
 Same CLI conventions and the same `re.fullmatch` self-check defense-in-depth as
