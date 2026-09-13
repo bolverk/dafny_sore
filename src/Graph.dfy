@@ -1234,6 +1234,88 @@ module BigramGraph {
   {
   }
 
+  // Establishes StepsOk for an arbitrary (non-empty) suffix walk[k..]/splits[k..] of an
+  // already-established StepsOk witness, in its own small, self-contained lemma -
+  // rather than the equivalent inline `assert StepsOk(g, afterRun, afterSplits, w) by
+  // { forall ... { StepsOkAt(...) } }` block this generalizes (afterRun/afterSplits
+  // being exactly walk[k..]/splits[k..] at every one of this file's several "peel off
+  // the front run, keep going on the rest" call sites). That inline form was confirmed
+  // (empirically, at more than one such call site) to verify fine under `dafny verify`
+  // but still intermittently fail under `dafny test`/`dafny build`'s invocation mode -
+  // the exact `dafny verify`-clean-but-build/test-flaky pattern this file's module
+  // header already documents, and which StepsOkAt itself was originally introduced to
+  // work around; isolating this one level further, into its own separately-verified
+  // lemma, is what actually holds up under both invocation modes.
+  lemma StepsOkSuffix(g: Graph, walk: seq<int>, splits: seq<nat>, w: string, k: int)
+    requires WF(g)
+    requires StepsOk(g, walk, splits, w)
+    requires 0 <= k < |walk|
+    ensures StepsOk(g, walk[k..], splits[k..], w)
+  {
+    var walk2 := walk[k..];
+    var splits2 := splits[k..];
+    forall i | 0 <= i < |walk2| ensures walk2[i] in g.nodes {
+      assert walk2[i] == walk[k + i];
+      StepsOkAt(g, walk, splits, w, k + i);
+    }
+    forall i | 0 <= i < |walk2|
+      ensures var lo := splits2[i]; var hi := splits2[i + 1];
+              lo <= hi <= |w| && Matches(g.labels[walk2[i]], w[lo..hi])
+    {
+      assert walk2[i] == walk[k + i];
+      assert splits2[i] == splits[k + i];
+      assert splits2[i + 1] == splits[k + i + 1];
+      StepsOkAt(g, walk, splits, w, k + i);
+    }
+  }
+
+  // Prepends a single new first step (v0, matching w[lo0..restSplits[0]]) onto an
+  // already-established StepsOk witness for the rest of the walk. Factored into its own
+  // small, self-contained lemma - rather than an inline `assert StepsOk(...) by { forall
+  // ... }` block re-derived at each "cons one node onto the front" call site - for the
+  // same verification-robustness reason StepsOkAt/ExtractWalkSplits already are (see the
+  // module header's note and the comment above ExtractWalkSplits): a handful of call
+  // sites that combine one new front step with a recursively-obtained StepsOk fact
+  // (CollapseStepsPreservesUntouched/LoopStepsPreservesRun's "else" branches) verified
+  // fine on their own but started failing once the shared Regex datatype grew a new
+  // constructor (RepRange) - even after already routing the shifted-index part through
+  // StepsOkAt, exactly as this file's other, still-passing sibling call sites do -
+  // confirmed (via `--isolate-assertions --filter-position`) to be a batch-context
+  // instability, not a genuinely false goal: every assertion in the surrounding lemma
+  // verifies in isolation. Isolating this "cons" step into its own tiny lemma, proved
+  // once with a minimal, self-contained context, sidesteps whatever specific
+  // trigger/fuel interaction the larger enclosing lemma's unrelated assertions were
+  // introducing into the same proof batch.
+  lemma StepsOkPrepend(g: Graph, v0: int, lo0: nat, rest: seq<int>, restSplits: seq<nat>, w: string)
+    requires WF(g)
+    requires v0 in g.nodes
+    requires StepsOk(g, rest, restSplits, w)
+    requires lo0 <= restSplits[0] <= |w|
+    requires Matches(g.labels[v0], w[lo0..restSplits[0]])
+    ensures StepsOk(g, [v0] + rest, [lo0] + restSplits, w)
+  {
+    var walk' := [v0] + rest;
+    var splits' := [lo0] + restSplits;
+    forall i | 0 <= i < |walk'| ensures walk'[i] in g.nodes {
+      if i == 0 {
+      } else {
+        assert walk'[i] == rest[i - 1];
+      }
+    }
+    forall i | 0 <= i < |walk'|
+      ensures var lo := splits'[i]; var hi := splits'[i + 1];
+              lo <= hi <= |w| && Matches(g.labels[walk'[i]], w[lo..hi])
+    {
+      if i == 0 {
+      } else {
+        assert walk'[i] == rest[i - 1];
+        assert splits'[i] == restSplits[i - 1];
+        assert splits'[i + 1] == restSplits[i];
+        StepsOkAt(g, rest, restSplits, w, i - 1);
+      }
+    }
+  }
+
   // The main induction: a ValidSteps segment in g, together with a splits witness
   // showing w's pieces match along it, contracts to a ValidSteps segment in g' with a
   // (shorter) splits witness showing the SAME w still matches along it.
@@ -1458,11 +1540,11 @@ module BigramGraph {
     ContractSimplePathWF(g, x, y);
     var m := FreshNode(g.nodes);
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
-    var splits: seq<nat> :| |splits| == |walk| + 1 &&
-      splits[0] == 0 && splits[|walk|] == |w| &&
-      (forall i :: 0 <= i < |walk| ==>
-        var lo := splits[i]; var hi := splits[i + 1];
-        lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi]));
+    // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
+    // extraction - the latter started failing to establish existence here under the new
+    // Regex datatype (a `dafny verify`-clean-but-`dafny test`/`dafny build`-flaky
+    // instance, per this file's module header note).
+    var splits := ExtractWalkSplits(g, walk, w);
     OccurrencePairing(g, x, y, walk);
     assert StepsOk(g, walk, splits, w) by {
       forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
@@ -1790,11 +1872,10 @@ module BigramGraph {
     MergeAnyWF(g, a, b);
     var m := FreshNode(g.nodes);
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
-    var splits: seq<nat> :| |splits| == |walk| + 1 &&
-      splits[0] == 0 && splits[|walk|] == |w| &&
-      (forall i :: 0 <= i < |walk| ==>
-        var lo := splits[i]; var hi := splits[i + 1];
-        lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi]));
+    // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
+    // extraction - the latter started failing to establish existence here under the new
+    // Regex datatype.
+    var splits := ExtractWalkSplits(g, walk, w);
     assert StepsOk(g, walk, splits, w) by {
       forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
       }
@@ -2097,11 +2178,10 @@ module BigramGraph {
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
     assert IsWalk(g, walk);
     assert WalkMatches(g, walk, w);
-    var splits: seq<nat> :| |splits| == |walk| + 1 &&
-      splits[0] == 0 && splits[|walk|] == |w| &&
-      (forall i :: 0 <= i < |walk| ==>
-        var lo := splits[i]; var hi := splits[i + 1];
-        lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi]));
+    // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
+    // extraction - the latter started failing to establish existence here under the new
+    // Regex datatype.
+    var splits := ExtractWalkSplits(g, walk, w);
     assert StepsOk(g, walk, splits, w) by {
       forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
       }
@@ -2578,33 +2658,20 @@ module BigramGraph {
             }
           }
         }
-        assert StepsOk(g', walk', splits', w) by {
-          assert |walk'| >= 1;
-          assert |splits'| == |walk'| + 1;
-          forall i | 0 <= i < |walk'| ensures walk'[i] in g'.nodes {
-            if i == 0 {
-            } else {
-              assert walk'[i] == restWalk'[i - 1];
-            }
-          }
-          forall i | 0 <= i < |walk'|
-            ensures var lo := splits'[i]; var hi := splits'[i + 1];
-                    lo <= hi <= |w| && Matches(g'.labels[walk'[i]], w[lo..hi])
-          {
-            if i == 0 {
-              assert g'.labels[walk[0]] == g.labels[walk[0]];
-            } else {
-              assert walk'[i] == restWalk'[i - 1];
-              assert splits'[i] == restSplits'[i - 1];
-              assert splits'[i + 1] == restSplits'[i];
-            }
-          }
-        }
+        // Routed through StepsOkPrepend (rather than an inline `assert StepsOk(...) by
+        // { forall ... }` block) since this exact "cons one untouched front step onto a
+        // recursively-obtained StepsOk witness" shape started failing under the new
+        // Regex datatype - see StepsOkPrepend's own comment for why.
+        StepsOkAt(g, walk, splits, w, 0);
+        assert g'.labels[walk[0]] == g.labels[walk[0]];
+        assert walk[0] in g'.nodes;
+        assert restSplits'[0] == restSplits[0];
+        StepsOkPrepend(g', walk[0], splits[0], restWalk', restSplits', w);
       }
     }
   }
 
-  lemma {:timeLimitMultiplier 12} CollapseStepsPreservesRun(g: Graph, C: set<int>, m: int, g': Graph,
+  lemma {:timeLimitMultiplier 24} CollapseStepsPreservesRun(g: Graph, C: set<int>, m: int, g': Graph,
                                 walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanContractSCC(g, C)
@@ -2636,17 +2703,29 @@ module BigramGraph {
       assert afterSplits == splits[k..];
       var run := walk[..k];
       var runSplits := splits[..k + 1];
-      forall i | 0 <= i < k ensures run[i] in C {
+      assert |run| == k;
+      // Bound with `|run|` (rather than `k`, even though `|run| == k`) and the
+      // per-index Matches conjunct routed through SplitsOk/SplitsOkImpliesForall (see
+      // their comments above ChainWrapAux) instead of a bare local `forall` statement -
+      // both needed for the same reason as the analogous PlusOfRunAccepts call site
+      // above: matching this call's identically-shaped `requires` conjunct against an
+      // ambient/locally-derived fact of the same shape proved fragile once the shared
+      // Regex datatype grew a new constructor (RepRange).
+      forall i | 0 <= i < |run| ensures run[i] in C {
         assert run[i] == walk[i];
       }
-      forall i | 0 <= i < k
-        ensures var lo := runSplits[i]; var hi := runSplits[i + 1];
-                lo <= hi <= |w| && Matches(g.labels[run[i]], w[lo..hi])
-      {
-        StepsOkAt(g, walk, splits, w, i);
-        assert run[i] == walk[i];
-        assert runSplits[i] == splits[i];
-        assert runSplits[i + 1] == splits[i + 1];
+      forall i | 0 <= i < |run| ensures run[i] in g.nodes {
+      }
+      assert SplitsOk(g, run, runSplits, w) by {
+        forall i | 0 <= i < |run|
+          ensures var lo := runSplits[i]; var hi := runSplits[i + 1];
+                  lo <= hi <= |w| && Matches(g.labels[run[i]], w[lo..hi])
+        {
+          StepsOkAt(g, walk, splits, w, i);
+          assert run[i] == walk[i];
+          assert runSplits[i] == splits[i];
+          assert runSplits[i + 1] == splits[i + 1];
+        }
       }
       assert runSplits[0] == splits[0];
       assert runSplits[k] == splits[k];
@@ -2654,6 +2733,7 @@ module BigramGraph {
         assert 0 <= 0 < k;
         assert var lo := runSplits[0]; var hi := runSplits[1]; lo <= hi <= |w|;
       }
+      SplitsOkImpliesForall(g, run, runSplits, w);
       StarOfUnionAccepts(g, C, cs, run, runSplits, w);
       assert splits[0] <= splits[k] <= |w| by {
         assert runSplits[0] <= runSplits[k] <= |w|;
@@ -2690,20 +2770,14 @@ module BigramGraph {
             assert afterRun[i] == walk[k + i] && afterRun[i + 1] == walk[k + i + 1];
           }
         }
-        assert StepsOk(g, afterRun, afterSplits, w) by {
-          forall i | 0 <= i < |afterRun| ensures afterRun[i] in g.nodes {
-            assert afterRun[i] == walk[k + i];
-          }
-          forall i | 0 <= i < |afterRun|
-            ensures var lo := afterSplits[i]; var hi := afterSplits[i + 1];
-                    lo <= hi <= |w| && Matches(g.labels[afterRun[i]], w[lo..hi])
-          {
-            StepsOkAt(g, walk, splits, w, k + i);
-            assert afterRun[i] == walk[k + i];
-            assert afterSplits[i] == splits[k + i];
-            assert afterSplits[i + 1] == splits[k + i + 1];
-          }
-        }
+        // Routed through the dedicated StepsOkSuffix lemma (see its own comment) rather
+        // than an inline `assert StepsOk(...) by { forall ... }` block - the latter
+        // verified fine under `dafny verify` but was empirically confirmed to fail here
+        // under `dafny test`/`dafny build` specifically.
+        assert 0 <= k < |walk|;
+        assert afterRun == walk[k..] && afterSplits == splits[k..];
+        StepsOkSuffix(g, walk, splits, w, k);
+        assert StepsOk(g, afterRun, afterSplits, w);
         CollapseStepsPreserves(g, C, m, g', afterRun, afterSplits, w);
         var afterWalk' := CollapseRuns(afterRun, C, m);
         var afterSplits' := CollapseSplits(afterRun, afterSplits, C, m);
@@ -2801,11 +2875,11 @@ module BigramGraph {
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
     assert IsWalk(g, walk);
     assert WalkMatches(g, walk, w);
-    var splits: seq<nat> :| |splits| == |walk| + 1 &&
-      splits[0] == 0 && splits[|walk|] == |w| &&
-      (forall i :: 0 <= i < |walk| ==>
-        var lo := splits[i]; var hi := splits[i + 1];
-        lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi]));
+    // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
+    // extraction - the latter started failing to establish existence here under the new
+    // Regex datatype (a `dafny verify`-clean-but-`dafny test`/`dafny build`-flaky
+    // instance, per this file's module header note).
+    var splits := ExtractWalkSplits(g, walk, w);
     assert StepsOk(g, walk, splits, w) by {
       forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
       }
@@ -3041,11 +3115,11 @@ module BigramGraph {
   {
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
     SingleInteriorWalkShape(g, m, walk);
-    var splits: seq<nat> :| |splits| == |walk| + 1 &&
-      splits[0] == 0 && splits[|walk|] == |w| &&
-      (forall i :: 0 <= i < |walk| ==>
-        var lo := splits[i]; var hi := splits[i + 1];
-        lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi]));
+    // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
+    // extraction - the latter started failing to establish existence here under the new
+    // Regex datatype (a `dafny verify`-clean-but-`dafny test`/`dafny build`-flaky
+    // instance, per this file's module header note).
+    var splits := ExtractWalkSplits(g, walk, w);
     assert walk == [g.start, m, g.end];
     assert Matches(g.labels[g.start], w[splits[0]..splits[1]]);
     assert Matches(g.labels[m], w[splits[1]..splits[2]]);
@@ -3572,11 +3646,10 @@ module BigramGraph {
     if GraphAccepts(g1, w) {
       var walk :| IsWalk(g1, walk) && WalkMatches(g1, walk, w);
       assert IsWalk(g2, walk);
-      var splits: seq<nat> :| |splits| == |walk| + 1 &&
-        splits[0] == 0 && splits[|walk|] == |w| &&
-        (forall i :: 0 <= i < |walk| ==>
-          var lo := splits[i]; var hi := splits[i + 1];
-          lo <= hi <= |w| && Matches(g1.labels[walk[i]], w[lo..hi]));
+      // Routed through ExtractWalkSplits (see its own comment) rather than an inline
+      // `:|` extraction - the latter started failing to establish existence here under
+      // the new Regex datatype.
+      var splits := ExtractWalkSplits(g1, walk, w);
       assert WalkMatches(g2, walk, w) by {
         forall i | 0 <= i < |walk|
           ensures var lo := splits[i]; var hi := splits[i + 1];
@@ -3588,11 +3661,11 @@ module BigramGraph {
     if GraphAccepts(g2, w) {
       var walk :| IsWalk(g2, walk) && WalkMatches(g2, walk, w);
       assert IsWalk(g1, walk);
-      var splits: seq<nat> :| |splits| == |walk| + 1 &&
-        splits[0] == 0 && splits[|walk|] == |w| &&
-        (forall i :: 0 <= i < |walk| ==>
-          var lo := splits[i]; var hi := splits[i + 1];
-          lo <= hi <= |w| && Matches(g2.labels[walk[i]], w[lo..hi]));
+      // Routed through ExtractWalkSplits (see its own comment) rather than an inline
+      // `:|` extraction - the latter started failing to establish existence here under
+      // the new Regex datatype (a `dafny verify`-clean-but-`dafny test`/`dafny
+      // build`-flaky instance, per this file's module header note).
+      var splits := ExtractWalkSplits(g2, walk, w);
       assert WalkMatches(g1, walk, w) by {
         forall i | 0 <= i < |walk|
           ensures var lo := splits[i]; var hi := splits[i + 1];
@@ -4157,11 +4230,11 @@ module BigramGraph {
     assert g.nodes == InteriorNodes(g) + {g.start, g.end};
     assert g.nodes == {g.start, g.end, m};
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w0);
-    var splits: seq<nat> :| |splits| == |walk| + 1 &&
-      splits[0] == 0 && splits[|walk|] == |w0| &&
-      (forall i :: 0 <= i < |walk| ==>
-        var lo := splits[i]; var hi := splits[i + 1];
-        lo <= hi <= |w0| && Matches(g.labels[walk[i]], w0[lo..hi]));
+    // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
+    // extraction - the latter started failing to establish existence here under the new
+    // Regex datatype (a `dafny verify`-clean-but-`dafny test`/`dafny build`-flaky
+    // instance, per this file's module header note).
+    var splits := ExtractWalkSplits(g, walk, w0);
     assert |walk| != 2 by {
       if |walk| == 2 {
         assert walk[0] == g.start && walk[1] == g.end;
@@ -4863,18 +4936,29 @@ module BigramGraph {
     forall i | 0 <= i < |restRun| ensures restRun[i] == v {
       assert restRun[i] == run[i + 1];
     }
-    forall i | 0 <= i < |restRun|
-      ensures var lo := restSplits[i]; var hi := restSplits[i + 1];
-              lo <= hi <= |w| && Matches(g.labels[restRun[i]], w[lo..hi])
-    {
-      assert restRun[i] == run[i + 1];
-      assert restSplits[i] == runSplits[i + 1];
-      assert restSplits[i + 1] == runSplits[i + 2];
+    // Routed through SplitsOk/SplitsOkImpliesForall (see their comments above
+    // ChainWrapAux) instead of leaving this call's identically-shaped `requires`
+    // conjunct to be matched directly against a local `forall` statement's fact - the
+    // same "verifies fine alone, fails to be picked up by the next call" brittleness
+    // documented at SplitsOkImpliesForall, which started biting this call too once the
+    // shared Regex datatype grew a new constructor (RepRange).
+    forall i | 0 <= i < |restRun| ensures restRun[i] in g.nodes {
+    }
+    assert SplitsOk(g, restRun, restSplits, w) by {
+      forall i | 0 <= i < |restRun|
+        ensures var lo := restSplits[i]; var hi := restSplits[i + 1];
+                lo <= hi <= |w| && Matches(g.labels[restRun[i]], w[lo..hi])
+      {
+        assert restRun[i] == run[i + 1];
+        assert restSplits[i] == runSplits[i + 1];
+        assert restSplits[i + 1] == runSplits[i + 2];
+      }
     }
     assert restSplits[0] <= |w| by {
       assert restSplits[0] == runSplits[1];
       assert var lo := runSplits[0]; var hi := runSplits[1]; lo <= hi <= |w|;
     }
+    SplitsOkImpliesForall(g, restRun, restSplits, w);
     StarOfUnionAccepts(g, {v}, [v], restRun, restSplits, w);
     assert UnionAllLabels(g, [v]) == g.labels[v];
     assert Matches(g.labels[v], w[runSplits[0]..runSplits[1]]) by {
@@ -4896,6 +4980,58 @@ module BigramGraph {
       assert w[runSplits[0]..runSplits[k]][..runSplits[1] - runSplits[0]] == w[runSplits[0]..runSplits[1]];
       assert w[runSplits[0]..runSplits[k]][runSplits[1] - runSplits[0]..] == w[runSplits[1]..runSplits[k]];
     }
+  }
+
+  // Wraps "slice a run of k consecutive v-labeled steps off the front of a StepsOk
+  // witness, then call PlusOfRunAccepts on it" into its own small, self-contained
+  // lemma. LoopStepsPreservesRun's own call site used to do all of this inline
+  // (computing run/runSplits, establishing PlusOfRunAccepts's per-index `Matches`
+  // precondition via SplitsOk/SplitsOkImpliesForall, then calling PlusOfRunAccepts) -
+  // that inline form verified fine under `dafny verify` but was empirically confirmed
+  // to still intermittently fail under `dafny test`/`dafny build`'s invocation mode
+  // specifically, evidently because LoopStepsPreservesRun's own body is otherwise large
+  // enough (many other assertions/lemma calls) to perturb this step's proof search even
+  // though every piece of it verifies fine in isolation. Moving the whole "slice +
+  // establish + call" sequence into this separate, minimal procedure - rather than just
+  // the "establish" part, as SplitsOkImpliesForall alone did for other call sites - is
+  // what actually holds up under both invocation modes.
+  lemma PlusOfRunAcceptsFromWalk(g: Graph, v: int, walk: seq<int>, splits: seq<nat>, w: string, k: int)
+    requires WF(g)
+    requires v in g.nodes
+    requires !Matches(g.labels[v], "")
+    requires StepsOk(g, walk, splits, w)
+    requires 0 < k <= |walk|
+    requires forall i :: 0 <= i < k ==> walk[i] == v
+    ensures splits[0] <= splits[k] <= |w|
+    ensures Matches(Plus(g.labels[v]), w[splits[0]..splits[k]])
+  {
+    var run := walk[..k];
+    var runSplits := splits[..k + 1];
+    assert |run| == k;
+    forall i | 0 <= i < |run| ensures run[i] == v {
+      assert run[i] == walk[i];
+    }
+    forall i | 0 <= i < |run| ensures run[i] in g.nodes {
+    }
+    assert SplitsOk(g, run, runSplits, w) by {
+      forall i | 0 <= i < |run|
+        ensures var lo := runSplits[i]; var hi := runSplits[i + 1];
+                lo <= hi <= |w| && Matches(g.labels[run[i]], w[lo..hi])
+      {
+        StepsOkAt(g, walk, splits, w, i);
+        assert run[i] == walk[i];
+        assert runSplits[i] == splits[i];
+        assert runSplits[i + 1] == splits[i + 1];
+      }
+    }
+    assert runSplits[0] == splits[0];
+    assert runSplits[k] == splits[k];
+    assert runSplits[0] <= |w| by {
+      StepsOkAt(g, walk, splits, w, 0);
+    }
+    SplitsOkImpliesForall(g, run, runSplits, w);
+    PlusOfRunAccepts(g, v, run, runSplits, w);
+    assert w[splits[0]..splits[k]] == w[runSplits[0]..runSplits[k]];
   }
 
   lemma LoopStepsPreserves(g: Graph, v: int, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
@@ -5018,7 +5154,7 @@ module BigramGraph {
     }
   }
 
-  lemma {:timeLimitMultiplier 24} LoopStepsPreservesRun(g: Graph, v: int, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
+  lemma {:timeLimitMultiplier 100} LoopStepsPreservesRun(g: Graph, v: int, g': Graph, walk: seq<int>, splits: seq<nat>, w: string)
     requires WF(g)
     requires CanLoopToPlus(g, v)
     requires g' == LoopToPlusGraph(g, v)
@@ -5044,42 +5180,34 @@ module BigramGraph {
     assert afterRun == walk[k..];
     SkipCSplitsIsSuffix(walk, splits, C);
     assert afterSplits == splits[k..];
-    var run := walk[..k];
-    var runSplits := splits[..k + 1];
-    forall i | 0 <= i < k ensures run[i] == v {
-      assert run[i] == walk[i];
-      assert run[i] in C;
+    // Routed through the dedicated PlusOfRunAcceptsFromWalk lemma (see its own comment)
+    // rather than inline "slice run/runSplits off walk/splits, establish
+    // PlusOfRunAccepts's precondition, call it" code - the inline form verified fine
+    // under `dafny verify` but was empirically confirmed to still intermittently fail
+    // under `dafny test`/`dafny build` specifically.
+    forall i | 0 <= i < k ensures walk[i] == v {
+      assert walk[i] in C;
     }
-    forall i | 0 <= i < k
-      ensures var lo := runSplits[i]; var hi := runSplits[i + 1];
-              lo <= hi <= |w| && Matches(g.labels[run[i]], w[lo..hi])
-    {
-      StepsOkAt(g, walk, splits, w, i);
-      assert run[i] == walk[i];
-      assert runSplits[i] == splits[i];
-      assert runSplits[i + 1] == splits[i + 1];
-    }
-    assert runSplits[0] == splits[0];
-    assert runSplits[k] == splits[k];
-    assert runSplits[0] <= |w| by {
-      assert 0 <= 0 < k;
-      assert var lo := runSplits[0]; var hi := runSplits[1]; lo <= hi <= |w|;
-    }
-    PlusOfRunAccepts(g, v, run, runSplits, w);
-    assert splits[0] <= splits[k] <= |w| by {
-      assert runSplits[0] <= runSplits[k] <= |w|;
-    }
-    assert Matches(Plus(g.labels[v]), w[splits[0]..splits[k]]) by {
-      assert w[splits[0]..splits[k]] == w[runSplits[0]..runSplits[k]];
-    }
+    PlusOfRunAcceptsFromWalk(g, v, walk, splits, w, k);
     assert g'.labels[v] == Plus(g.labels[v]);
 
     if |afterRun| == 0 {
       assert walk' == [v] + CollapseRuns(afterRun, C, v);
       assert CollapseRuns(afterRun, C, v) == [];
       assert walk' == [v];
-      assert splits' == [splits[0], splits[k]];
+      // k == |walk| (hence afterSplits, a suffix of splits starting at k, is exactly
+      // the singleton [splits[|walk|]]) is established BEFORE the `splits'` unfolding
+      // below that depends on it - relying on Z3 to derive this arithmetic fact
+      // on-demand, mid-rewrite, from `k := |walk| - |afterRun|` combined with
+      // `|afterRun| == 0` proved fragile here under `dafny test`/`dafny build`
+      // specifically (this fact is trivial and this exact assertion verifies fine
+      // under `dafny verify`).
       assert k == |walk|;
+      assert afterSplits == splits[k..];
+      assert |afterSplits| == 1;
+      assert afterSplits == [splits[k]];
+      assert splits' == [splits[0]] + afterSplits;
+      assert splits' == [splits[0], splits[k]];
       assert ValidSteps(g', walk') by {
         assert v in g'.nodes;
       }
@@ -5101,20 +5229,14 @@ module BigramGraph {
           assert afterRun[i] == walk[k + i] && afterRun[i + 1] == walk[k + i + 1];
         }
       }
-      assert StepsOk(g, afterRun, afterSplits, w) by {
-        forall i | 0 <= i < |afterRun| ensures afterRun[i] in g.nodes {
-          assert afterRun[i] == walk[k + i];
-        }
-        forall i | 0 <= i < |afterRun|
-          ensures var lo := afterSplits[i]; var hi := afterSplits[i + 1];
-                  lo <= hi <= |w| && Matches(g.labels[afterRun[i]], w[lo..hi])
-        {
-          StepsOkAt(g, walk, splits, w, k + i);
-          assert afterRun[i] == walk[k + i];
-          assert afterSplits[i] == splits[k + i];
-          assert afterSplits[i + 1] == splits[k + i + 1];
-        }
-      }
+      // Routed through the dedicated StepsOkSuffix lemma (see its own comment above
+      // StepsOkAt) rather than an inline `assert StepsOk(...) by { forall ... }` block -
+      // the equivalent inline form at this lemma's CollapseStepsPreservesRun sibling was
+      // empirically confirmed to fail under `dafny test`/`dafny build` specifically.
+      assert 0 <= k < |walk|;
+      assert afterRun == walk[k..] && afterSplits == splits[k..];
+      StepsOkSuffix(g, walk, splits, w, k);
+      assert StepsOk(g, afterRun, afterSplits, w);
       LoopStepsPreserves(g, v, g', afterRun, afterSplits, w);
       var afterWalk' := CollapseRuns(afterRun, C, v);
       var afterSplits' := CollapseSplits(afterRun, afterSplits, C, v);
@@ -5127,10 +5249,9 @@ module BigramGraph {
           SkipCRunHeadNotInC(walk, C);
           assert afterRun[0] !in C;
           assert afterRun[0] != v;
-          assert run[k - 1] == v;
+          assert walk[k - 1] == v;
           assert (v, afterRun[0]) in g.edges by {
             assert (walk[k - 1], walk[k]) in g.edges;
-            assert walk[k - 1] == run[k - 1];
             assert walk[k] == afterRun[0];
           }
           assert (v, afterRun[0]) != (v, v);
@@ -5138,42 +5259,20 @@ module BigramGraph {
           assert afterWalk'[0] == afterRun[0];
         }
       }
-      assert StepsOk(g', walk', splits', w) by {
-        forall i | 0 <= i < |walk'| ensures walk'[i] in g'.nodes {
-          if i == 0 {
-          } else {
-            assert walk'[i] == afterWalk'[i - 1];
-          }
-        }
-        forall i | 0 <= i < |walk'|
-          ensures var lo := splits'[i]; var hi := splits'[i + 1];
-                  lo <= hi <= |w| && Matches(g'.labels[walk'[i]], w[lo..hi])
-        {
-          if i == 0 {
-            var lo := splits'[0]; var hi := splits'[1];
-            assert lo == splits[0];
-            assert hi == splits[k];
-            assert lo <= hi <= |w|;
-            assert Matches(g'.labels[walk'[0]], w[lo..hi]) by {
-              assert walk'[0] == v;
-              assert g'.labels[v] == Plus(g.labels[v]);
-              assert Matches(Plus(g.labels[v]), w[splits[0]..splits[k]]);
-            }
-          } else {
-            assert walk'[i] == afterWalk'[i - 1];
-            assert splits'[i] == afterSplits'[i - 1];
-            assert splits'[i + 1] == afterSplits'[i];
-            StepsOkAt(g', afterWalk', afterSplits', w, i - 1);
-            var lo := splits'[i]; var hi := splits'[i + 1];
-            assert lo == afterSplits'[i - 1];
-            assert hi == afterSplits'[i];
-            assert Matches(g'.labels[walk'[i]], w[lo..hi]) by {
-              assert walk'[i] == afterWalk'[i - 1];
-              assert Matches(g'.labels[afterWalk'[i - 1]], w[afterSplits'[i - 1]..afterSplits'[i]]);
-            }
-          }
-        }
-      }
+      // Routed through StepsOkPrepend (see its own comment) instead of an inline
+      // `assert StepsOk(...) by { forall ... }` block re-deriving the same "cons the
+      // v step (already known, via PlusOfRunAccepts above, to accept the whole
+      // Plus-run) onto the recursively-obtained StepsOk witness for the rest" shape -
+      // even this already fairly hardened form (rebinding lo/hi and calling
+      // StepsOkAt) started failing under the new Regex datatype; confirmed via
+      // `--isolate-assertions --filter-position` to be a batch-context instability
+      // (every assertion here verifies fine on its own), not a genuinely false goal.
+      assert v in g'.nodes;
+      assert afterSplits'[0] == splits[k];
+      assert splits' == [splits[0]] + afterSplits';
+      assert splits[0] <= afterSplits'[0] <= |w|;
+      assert Matches(g'.labels[v], w[splits[0]..afterSplits'[0]]);
+      StepsOkPrepend(g', v, splits[0], afterWalk', afterSplits', w);
     }
   }
 
@@ -5189,11 +5288,11 @@ module BigramGraph {
     var g' := LoopToPlusGraph(g, v);
     LoopToPlusWF(g, v);
     var walk :| IsWalk(g, walk) && WalkMatches(g, walk, w);
-    var splits: seq<nat> :| |splits| == |walk| + 1 &&
-      splits[0] == 0 && splits[|walk|] == |w| &&
-      (forall i :: 0 <= i < |walk| ==>
-        var lo := splits[i]; var hi := splits[i + 1];
-        lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi]));
+    // Routed through ExtractWalkSplits (see its own comment) rather than an inline `:|`
+    // extraction - the latter started failing to establish existence here under the new
+    // Regex datatype (a `dafny verify`-clean-but-`dafny test`/`dafny build`-flaky
+    // instance, per this file's module header note).
+    var splits := ExtractWalkSplits(g, walk, w);
     assert StepsOk(g, walk, splits, w) by {
       forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
       }
@@ -5212,11 +5311,17 @@ module BigramGraph {
     assert IsWalk(g', walk');
     assert splits'[0] == 0;
     assert splits'[|walk'|] == |w|;
+    // The forall's body explicitly calls StepsOkAt (rather than being left empty to
+    // rely on Z3 automatically matching the ambient StepsOk(g', walk', splits', w) fact
+    // from LoopStepsPreserves's own ensures) - the empty-body form verified fine under
+    // `dafny verify` but was empirically confirmed to fail here under `dafny
+    // test`/`dafny build` specifically.
     assert WalkMatches(g', walk', w) by {
       forall i | 0 <= i < |walk'|
         ensures var lo := splits'[i]; var hi := splits'[i + 1];
                 lo <= hi <= |w| && Matches(g'.labels[walk'[i]], w[lo..hi])
       {
+        StepsOkAt(g', walk', splits', w, i);
       }
     }
   }
@@ -5591,6 +5696,60 @@ module BigramGraph {
     }
   }
 
+  // A "StepsOk"-shaped bundling of the per-index splits/Matches fact, analogous to
+  // StepsOk/StepsOkAt above (see their comments) but WITHOUT StepsOk's own `|walk| >= 1`
+  // requirement - needed here because ChainWrapAux's walkNodes/walkNodes' can
+  // legitimately be empty (an `order` that consumes no walk nodes still needs this
+  // conjunct to hold, vacuously). Bundling the per-index fact into its own predicate +
+  // "at one fixed index" lemma, rather than relying on Z3 to directly re-derive an
+  // unchanged (or freshly re-established) ambient forall against ChainWrapAux's own
+  // recursive-call `requires` clause of identical shape, is what restores robustness at
+  // ChainWrapAux's two self-recursive calls below - the very same "same forall, needs
+  // isolating into its own small lemma" brittleness StepsOkAt/StepsOkPrepend/
+  // ExtractWalkSplits above already document and work around, which started biting here
+  // too once the shared Regex datatype grew a new constructor (RepRange).
+  predicate SplitsOk(g: Graph, nodes: seq<int>, splits: seq<nat>, w: string)
+    requires WF(g)
+    requires forall i :: 0 <= i < |nodes| ==> nodes[i] in g.nodes
+  {
+    |splits| == |nodes| + 1 &&
+    (forall i :: 0 <= i < |nodes| ==>
+      var lo := splits[i]; var hi := splits[i + 1];
+      lo <= hi <= |w| && Matches(g.labels[nodes[i]], w[lo..hi]))
+  }
+
+  lemma SplitsOkAt(g: Graph, nodes: seq<int>, splits: seq<nat>, w: string, i: int)
+    requires WF(g)
+    requires forall j :: 0 <= j < |nodes| ==> nodes[j] in g.nodes
+    requires SplitsOk(g, nodes, splits, w)
+    requires 0 <= i < |nodes|
+    ensures splits[i] <= splits[i + 1] <= |w|
+    ensures Matches(g.labels[nodes[i]], w[splits[i]..splits[i + 1]])
+  {
+  }
+
+  // Converts the bundled SplitsOk predicate back into the raw per-index forall shape
+  // ChainWrapAux's own `requires` clause (unchangeable - see the task constraints) needs
+  // at its two self-recursive calls below. Doing this conversion inside its own small,
+  // separately-verified lemma - rather than inline, via a local `forall ... ensures ...`
+  // statement (optionally followed by a redundant restating `assert`) - is what actually
+  // makes it hold up under a full, whole-file verification run: that inline version was
+  // empirically confirmed (via `--isolate-assertions --filter-position`) to verify fine
+  // completely on its own, yet still intermittently failed to satisfy the immediately
+  // following recursive call once re-verified as part of the FULL file's much larger
+  // assertion/quantifier population - a further, more acute instance of the same
+  // batch-context brittleness StepsOkPrepend above already had to work around the same
+  // way (by moving the fragile step into its own separate lemma/procedure).
+  lemma SplitsOkImpliesForall(g: Graph, nodes: seq<int>, splits: seq<nat>, w: string)
+    requires WF(g)
+    requires forall i :: 0 <= i < |nodes| ==> nodes[i] in g.nodes
+    requires SplitsOk(g, nodes, splits, w)
+    ensures forall i :: 0 <= i < |nodes| ==>
+              var lo := splits[i]; var hi := splits[i + 1];
+              lo <= hi <= |w| && Matches(g.labels[nodes[i]], w[lo..hi])
+  {
+  }
+
   // ---- The main induction: walkNodes (a node-sequence drawn from `order`'s
   // membership, following real edges) matches w[splits[0]..splits[|walkNodes|]] against
   // ChainWrapRegex(g, order) - by peeling order's head at each step and deciding,
@@ -5651,6 +5810,14 @@ module BigramGraph {
       forall i | 0 <= i < |order'| ensures order'[i] in g.nodes {
         assert order[i + 1] == order'[i];
       }
+      // walkNodes/splits are unchanged from ChainWrapAux's own parameters here, so this
+      // recursive call's per-index `requires` conjunct is, semantically, just the
+      // ambient hypothesis restated - but routing it through SplitsOk/SplitsOkImpliesForall
+      // (see their comments above) rather than leaving Z3 to match it directly is what
+      // makes this recursive call verify reliably (a plain local `forall` statement
+      // restating the same fact was NOT enough - see SplitsOkImpliesForall's comment).
+      assert SplitsOk(g, walkNodes, splits, w);
+      SplitsOkImpliesForall(g, walkNodes, splits, w);
       ChainWrapAux(g, order', walkNodes, splits, w);
       OptSoundEps(g.labels[order[0]]);
       var lo := splits[0]; var hi := splits[|walkNodes|];
@@ -5713,13 +5880,24 @@ module BigramGraph {
       }
       SplitsChainMonotone(splits, 1, |walkNodes|);
       assert splits'[0] <= splits'[|walkNodes'|] <= |w|;
+      // Routed through SplitsOk/SplitsOkAt/SplitsOkImpliesForall (see their comments
+      // above ChainWrapAux) instead of leaving Z3 to re-derive
+      // `Matches(g.labels[walkNodes'[i]], ...)` from the ambient (shifted-by-one)
+      // hypothesis automatically - this call's `requires` conjunct is exactly this
+      // recursive call's precondition, which stopped verifying reliably once the shared
+      // Regex datatype grew a new constructor (RepRange). A plain local `forall`
+      // statement restating the same fact was NOT enough on its own - see
+      // SplitsOkImpliesForall's comment.
+      assert SplitsOk(g, walkNodes, splits, w);
       forall i | 0 <= i < |walkNodes'|
         ensures var lo := splits'[i]; var hi := splits'[i + 1]; lo <= hi <= |w| && Matches(g.labels[walkNodes'[i]], w[lo..hi])
       {
         assert splits'[i] == splits[i + 1] && splits'[i + 1] == splits[i + 2];
         assert walkNodes'[i] == walkNodes[i + 1];
+        SplitsOkAt(g, walkNodes, splits, w, i + 1);
       }
-
+      assert SplitsOk(g, walkNodes', splits', w);
+      SplitsOkImpliesForall(g, walkNodes', splits', w);
       ChainWrapAux(g, order', walkNodes', splits', w);
 
       var lo := splits[0]; var hi := splits[|walkNodes|]; var mid := hi1;
@@ -5763,6 +5941,27 @@ module BigramGraph {
       (forall i :: 0 <= i < |walk| ==>
         var lo := splits[i]; var hi := splits[i + 1];
         lo <= hi <= |w| && Matches(g.labels[walk[i]], w[lo..hi]));
+
+    // The final per-index `ensures` conjunct is re-derived below via
+    // SplitsOk/SplitsOkImpliesForall (see their comments above ChainWrapAux) instead of
+    // being left to follow directly from the `:|` witness's own (identically shaped)
+    // conjunct above: relying on Z3 to re-fold that ambient existential-witness fact
+    // through the `var lo := ...; var hi := ...;` binding into the exact shape this
+    // lemma's `ensures` names proved fragile once the shared Regex datatype grew a new
+    // constructor (RepRange) - and even routing it through StepsOk/StepsOkAt plus a
+    // local `forall` statement (an earlier version of this fix) verified fine under
+    // `dafny verify` but still intermittently failed this exact `ensures` under `dafny
+    // test`/`dafny build` (the very `dafny verify`-clean-but-build/test-flaky pattern
+    // this file's module header already documents). Converting the bundled fact back
+    // into a raw forall inside SplitsOkImpliesForall's own separately-verified lemma
+    // body, rather than inline here, is what actually holds up under both invocation
+    // modes.
+    assert forall i :: 0 <= i < |walk| ==> walk[i] in g.nodes by {
+      forall i | 0 <= i < |walk| ensures walk[i] in g.nodes {
+      }
+    }
+    assert SplitsOk(g, walk, splits, w);
+    SplitsOkImpliesForall(g, walk, splits, w);
   }
 
   // ---- The top-level soundness theorem: any accepted string is matched by the
@@ -5771,7 +5970,7 @@ module BigramGraph {
   // StartOnlyAtFront/EndOnlyAtBack, already proven for Round 7), and hands the
   // resulting interior-node subsequence to ChainWrapAux. ----
 
-  lemma ChainWrapSound(g: Graph, order: seq<int>, w: string)
+  lemma {:timeLimitMultiplier 4} ChainWrapSound(g: Graph, order: seq<int>, w: string)
     requires WF(g)
     requires NoBackEdges(g)
     requires g.labels[g.start] == Eps
@@ -5815,11 +6014,17 @@ module BigramGraph {
     }
 
     assert |wsplits| == |walkNodes| + 1;
-    forall i | 0 <= i < |walkNodes|
-      ensures var lo := wsplits[i]; var hi := wsplits[i + 1]; lo <= hi <= |w| && Matches(g.labels[walkNodes[i]], w[lo..hi])
-    {
-      assert wsplits[i] == splits[i + 1] && wsplits[i + 1] == splits[i + 2];
-      assert walkNodes[i] == walk[i + 1];
+    // Routed through SplitsOk/SplitsOkImpliesForall (see their comments above
+    // ChainWrapAux) instead of leaving the plain local `forall` statement's fact to be
+    // matched directly against the ChainWrapAux call's identically-shaped `requires`
+    // conjunct below - the same brittleness documented at SplitsOkImpliesForall.
+    assert SplitsOk(g, walkNodes, wsplits, w) by {
+      forall i | 0 <= i < |walkNodes|
+        ensures var lo := wsplits[i]; var hi := wsplits[i + 1]; lo <= hi <= |w| && Matches(g.labels[walkNodes[i]], w[lo..hi])
+      {
+        assert wsplits[i] == splits[i + 1] && wsplits[i + 1] == splits[i + 2];
+        assert walkNodes[i] == walk[i + 1];
+      }
     }
 
     // wsplits[0] (== splits[1]) is forced to 0: labels[walk[0]] == labels[g.start] == Eps
@@ -5845,6 +6050,7 @@ module BigramGraph {
       assert lo == |w|;
     }
 
+    SplitsOkImpliesForall(g, walkNodes, wsplits, w);
     ChainWrapAux(g, order, walkNodes, wsplits, w);
     assert w[wsplits[0]..wsplits[|walkNodes|]] == w;
   }

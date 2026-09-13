@@ -56,9 +56,9 @@ module Print {
   }
 
   // Does r need (?:...) wrapping when it appears as the operand of a repetition
-  // operator (Star/Plus/Opt), or as one side of a Concat? True for anything that isn't
-  // already a single atom (Sym/Eps/Empty), except an all-Sym Union - printed as a
-  // bracket class, [abc] is atomic too.
+  // operator (Star/Plus/Opt/RepRange), or as one side of a Concat? True for anything
+  // that isn't already a single atom (Sym/Eps/Empty), except an all-Sym Union - printed
+  // as a bracket class, [abc] is atomic too.
   function NeedsGroup(r: Regex): bool {
     match r
     case Sym(_) => false
@@ -69,6 +69,15 @@ module Print {
     case Star(_) => true
     case Opt(_) => true
     case Plus(_) => true
+    case RepRange(r', lo, hi) =>
+      // Must track PrettyPrint's own special-cased RepRange forms below exactly: a
+      // RepRange that prints as "(?!)"/""/r' itself is exactly as atomic as
+      // Empty/Eps/r' would be, and only the general "...{lo,hi}"/"...?" forms need
+      // wrapping like Star/Plus/Opt do.
+      if lo > hi then false
+      else if hi == 0 then false
+      else if lo == 1 && hi == 1 then NeedsGroup(r')
+      else true
   }
 
   // Wrap an already-printed sub-expression in (?:...) iff its AST shape needs it. Takes
@@ -120,7 +129,21 @@ module Print {
       var s := Simplify(r');
       if s == Eps then Eps else Opt(s)
     case Plus(r') => Plus(Simplify(r'))
+    case RepRange(r', lo, hi) =>
+      var s := Simplify(r');
+      if lo > hi then Empty       // empty range: matches nothing, same as Empty
+      else if hi == 0 then Eps    // (lo <= hi and hi == 0, so lo == 0 too): only "" matches
+      else if lo == 1 && hi == 1 then s  // exactly one repetition: same as r' itself
+      else RepRange(s, lo, hi)
     case _ => r
+  }
+
+  // Render a nat in ordinary decimal, for RepRange's `{lo,hi}` bounds.
+  function NatToString(n: nat): string
+    decreases n
+  {
+    if n < 10 then [('0' as int + n) as char]
+    else NatToString(n / 10) + [('0' as int + n % 10) as char]
   }
 
   function PrettyPrint(r: Regex): string
@@ -137,5 +160,17 @@ module Print {
     case Star(r') => WrapIfNeeded(r', PrettyPrint(r')) + "*"
     case Opt(r') => WrapIfNeeded(r', PrettyPrint(r')) + "?"
     case Plus(r') => WrapIfNeeded(r', PrettyPrint(r')) + "+"
+    case RepRange(r', lo, hi) =>
+      // Standard regex bounded-repetition syntax r{lo,hi}, with the more idiomatic
+      // shorter forms substituted where they apply: an empty [lo,hi] range matches
+      // nothing (same as Empty); {0,0} matches only "" (same as Eps); {1,1} is just r'
+      // itself; {0,1} is exactly Opt, so it prints as r? to match Opt's own printing;
+      // and {n,n} for n > 1 prints as the shorter r{n} instead of r{n,n}.
+      if lo > hi then "(?!)"
+      else if hi == 0 then ""
+      else if lo == 1 && hi == 1 then PrettyPrint(r')
+      else if lo == 0 && hi == 1 then WrapIfNeeded(r', PrettyPrint(r')) + "?"
+      else if lo == hi then WrapIfNeeded(r', PrettyPrint(r')) + "{" + NatToString(lo) + "}"
+      else WrapIfNeeded(r', PrettyPrint(r')) + "{" + NatToString(lo) + "," + NatToString(hi) + "}"
   }
 }

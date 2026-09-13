@@ -29,6 +29,7 @@ module Tests {
     case Star(r') => CountSym(r', c)
     case Opt(r') => CountSym(r', c)
     case Plus(r') => CountSym(r', c)
+    case RepRange(r', lo, hi) => CountSym(r', c)
   }
 
   function AllCharsOf(t: string): seq<char>
