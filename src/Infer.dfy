@@ -4,9 +4,14 @@
 // symbol order, an independent, easy-to-verify checker (CheckOrderAll/NoDup) confirms
 // whether that candidate actually works for every sample, and only if it does do we
 // build the chain regex from it (proved sound and single-occurrence via Chain.dfy). If
-// the checker rejects the candidate for any reason, we fall back to the trivial but
-// always sound and always single-occurrence Star-of-union-of-symbols regex over the
-// sample alphabet.
+// the checker rejects the candidate, we fall through tier 2 (a periodic block, see
+// InferGroupFallbackCore below) and finally tier 3 (the trivial but always sound and
+// always single-occurrence union-of-symbols regex over the sample alphabet). Both of
+// those last two tiers repeat their own sub-expression a TIGHTLY BOUNDED number of times
+// (RepRange(_, lo, hi), Regex.dfy) rather than unboundedly (the old Plus/Star): the
+// bound (maxK for tier 2, maxLen for tier 3) is computed per call from the actual sample
+// batch being handled, as the most repetitions any single sample in that batch actually
+// needs - never a universal constant, and never looser than that observed maximum.
 //
 // Infer is a `method`, not a `function`: converting the input `set<string>` into some
 // concrete enumeration order requires an assign-such-that (`x :| x in rem`) pick, and
@@ -333,8 +338,19 @@ module SoreInfer {
   // the whole thing against every sample via CheckPeriodChoiceAll. The heuristic itself
   // carries no correctness burden beyond terminating with *some* period and alphabets;
   // e.g. for {"abab","acac"}, p=2 with position-0 alphabet {a} and position-1 alphabet
-  // {b,c} gives (?:a(?:b|c))+ instead of a full wildcard. Reduces to the old literal-only
-  // behavior exactly when every position's alphabet happens to be a singleton.
+  // {b,c} gives (?:a(?:b|c)){1,2} instead of a full wildcard. Reduces to the old
+  // literal-only behavior exactly when every position's alphabet happens to be a
+  // singleton.
+  //
+  // The repetition count is TIGHTLY BOUNDED, not unbounded: every sample t reaching this
+  // tier is forced (by FitsPeriodChoice) to be exactly PeriodRepCount(t, p) copies of the
+  // block, so InferGroupFallbackCore below builds RepRange(BlockPieces(Sigmas), 1, maxK)
+  // with maxK := MaxKForPeriod(strs, p) - the largest repetition count actually observed
+  // across this component's own samples (both in Chain.dfy) - rather than the unbounded
+  // Plus(BlockPieces(Sigmas)) this tier used to emit. E.g. {"abab"} alone gives maxK=2,
+  // i.e. (?:ab){1,2}, not (?:ab)+; {"abab","acac"} still gives maxK=2 (both samples have
+  // 2 repetitions), i.e. (?:a(?:b|c)){1,2}. See FitsPeriodChoiceKCopies in Chain.dfy for
+  // the soundness bridge (via MatchesKCopies/MatchesKCopiesImpliesRepRange in Regex.dfy).
 
   // The first non-empty string in strs, if any.
   function FirstNonEmpty(strs: seq<string>): string
@@ -2126,18 +2142,29 @@ module SoreInfer {
       var Sigmas := BuildSigmas(strs, p, 0);
 
       if p >= 1 && CheckPeriodChoiceAll(strs, p, Sigmas) && SigmasPairwiseDisjoint(Sigmas) {
-        r := Plus(BlockPieces(Sigmas));
+        // Tight bound: every sample t reaching this branch is forced (by
+        // FitsPeriodChoice) to be exactly PeriodRepCount(t, p) copies of the p-position
+        // block, so the largest count actually observed across strs - maxK - is the
+        // most repetitions RepRange ever needs to allow, rather than the old unbounded
+        // Plus's "any number >= 1".
+        var maxK := MaxKForPeriod(strs, p);
+        r := RepRange(BlockPieces(Sigmas), 1, maxK);
 
         BuildSigmasLength(strs, p, 0);
         assert |Sigmas| == p;
         BuildSigmasNoDup(strs, p, 0);
         assert forall j :: 0 <= j < |Sigmas| ==> NoDup(Sigmas[j]);
         PeriodicChoiceIsSore(Sigmas);
+        RepRangeIsSore(BlockPieces(Sigmas), 1, maxK);
 
         forall t | t in strs ensures Matches(r, t) {
           CheckPeriodChoiceAllSound(strs, p, Sigmas, t);
           assert t != "";
-          FitsPeriodChoiceSound(t, p, Sigmas);
+          FitsPeriodChoiceKCopies(t, p, Sigmas);
+          assert MatchesKCopies(BlockPieces(Sigmas), t, PeriodRepCount(t, p));
+          MaxKForPeriodBound(strs, p, t);
+          assert 1 <= PeriodRepCount(t, p) <= maxK;
+          MatchesKCopiesImpliesRepRange(BlockPieces(Sigmas), 1, maxK, PeriodRepCount(t, p), t);
         }
 
         BlockPiecesSymbols(Sigmas);
@@ -2151,16 +2178,26 @@ module SoreInfer {
       } else {
         var alpha := AlphabetAll(strs);
         var cs := SortedCharSeq(alpha);
-        r := Star(UnionAll(cs));
+        // Tight bound: every sample t here has some known length |t|, and spelling it
+        // out one character at a time (as UnionKCopies's induction already does) never
+        // needs more than |t| repetitions - so the longest sample's length, maxLen, is
+        // the most repetitions RepRange ever needs, rather than the old unbounded
+        // Star's "any number >= 0".
+        var maxLen := MaxLen(strs);
+        r := RepRange(UnionAll(cs), 0, maxLen);
 
         UnionAllIsSore(cs);
-        StarIsSore(UnionAll(cs));
+        RepRangeIsSore(UnionAll(cs), 0, maxLen);
 
         forall t | t in strs ensures Matches(r, t) {
           forall i | 0 <= i < |t| ensures t[i] in alpha {
             AlphabetAllSound(strs, t, i);
           }
-          UnionStarSound(cs, alpha, t);
+          UnionKCopies(cs, alpha, t);
+          assert MatchesKCopies(UnionAll(cs), t, |t|);
+          MaxLenBound(strs, t);
+          assert 0 <= |t| <= maxLen;
+          MatchesKCopiesImpliesRepRange(UnionAll(cs), 0, maxLen, |t|, t);
         }
 
         UnionAllSymbolsMultiset(cs);

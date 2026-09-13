@@ -110,10 +110,16 @@ module Tests {
   method {:test} TestConflictingOrderFallsBackToWildcard() {
     CheckOneSet({"ab", "ba"}, "conflicting order ab/ba");
     // "ab" and "ba" disagree on the relative order of a and b, so no single-occurrence
-    // chain can fit both - Infer must fall back to the wildcard, which (unlike any
-    // chain) also accepts strings outside the original sample set, like "aabb".
+    // chain can fit both - Infer falls through to tier 2's periodic-block construction,
+    // which here degenerates to period p=1 (a trivial one-position "block" whose only
+    // choice is the whole alphabet {a,b}), i.e. a bounded (?:[ab]){1,2} rather than an
+    // unbounded (?:[ab])+ - so it still accepts strings outside the two original
+    // samples, like "aa" (an over-generalization within the observed length bound), but
+    // no longer "aabb": both samples are length 2, so maxK=2 and "aabb" would need 4
+    // one-character repetitions, past the tight bound.
     var r := Infer({"ab", "ba"});
-    expect Matches(r, "aabb"), "expected the wildcard fallback to accept aabb";
+    expect Matches(r, "aa"), "expected the local wildcard-like fallback to still over-generalize within the observed length bound";
+    expect !Matches(r, "aabb"), "expected the tight bound to reject aabb (needs 4 reps, more than any sample's 2)";
   }
 
   method {:test} TestEmptyAndRepeats() {
@@ -135,10 +141,13 @@ module Tests {
   method {:test} TestNonConsecutiveRepeat() {
     // "abab" repeats 'a' and 'b' non-consecutively, so tier 1 (the per-symbol chain)
     // can't fit it - but it IS a periodic block ("ab" repeated), so tier 2 should catch
-    // it and produce (ab)+ rather than falling all the way to the wildcard.
-    CheckOneSet({"abab"}, "periodic block abab = (ab)+");
+    // it and produce (ab){1,2} - the single sample "abab" has exactly 2 repetitions of
+    // "ab" (maxK = 4/2 = 2), so that's the tightest bound that still accepts it, not the
+    // old unbounded (ab)+.
+    CheckOneSet({"abab"}, "periodic block abab = (ab){1,2}");
     var r := Infer({"abab"});
-    expect Matches(r, "ababab"), "(ab)+ should also accept more repetitions of the block";
+    expect Matches(r, "ab"), "(ab){1,2} should still accept a single repetition, within the tight bound";
+    expect !Matches(r, "ababab"), "expected the tight bound to reject a 3rd repetition, more than any sample ever showed";
     expect !Matches(r, "aabb"), "expected the precise block regex, not the wildcard fallback";
     expect !Matches(r, "ba"), "expected the block regex to reject a wrong-phase rotation";
     expect !Matches(r, "aba"), "expected the block regex to reject an incomplete trailing block";
@@ -146,22 +155,28 @@ module Tests {
 
   method {:test} TestMultipleSamplesSameBlock() {
     // Several samples that are all powers of the same block "ab": should still take the
-    // tier-2 block path, not the wildcard.
+    // tier-2 block path, not the wildcard. The longest sample, "ababab", has 3
+    // repetitions, so maxK=3 - tight enough to accept every sample but reject a 4th
+    // repetition nothing in the input ever showed.
     CheckOneSet({"ab", "abab", "ababab"}, "multiple samples, shared block ab");
     var r := Infer({"ab", "abab", "ababab"});
     expect !Matches(r, "aabb"), "expected the precise block regex, not the wildcard fallback";
+    expect !Matches(r, "abababab"), "expected the tight bound (maxK=3) to reject a 4th repetition";
   }
 
   method {:test} TestPeriodicBlockWithChoice() {
     // "abab"/"acac": both periodic with period 2, sharing 'a' at even positions but
     // differing (b vs c) at odd positions. Tier 2 now allows a per-position choice
     // within the repeated block, not just a fixed literal, so this should produce
-    // (?:a(?:b|c))+ rather than falling all the way to a full wildcard over {a,b,c}.
+    // (?:a(?:b|c)){1,2} - both samples have exactly 2 repetitions, so maxK=2 - rather
+    // than falling all the way to a full wildcard over {a,b,c}, or the old unbounded
+    // (?:a(?:b|c))+.
     CheckOneSet({"abab", "acac"}, "periodic block with internal choice: abab/acac");
     var r := Infer({"abab", "acac"});
     expect Matches(r, "abab"), "expected abab to still be accepted";
     expect Matches(r, "acac"), "expected acac to still be accepted";
-    expect Matches(r, "ababac"), "expected mixed repetitions across the choice to be accepted";
+    expect Matches(r, "abac"), "expected mixing the two alternatives across the 2 observed repetitions to be accepted";
+    expect !Matches(r, "ababac"), "expected the tight bound (maxK=2) to reject a 3rd repetition";
     expect !Matches(r, "bb"), "expected the block regex to reject a run without the shared 'a'";
     expect !Matches(r, "ca"), "expected the block regex to reject a wrong-phase rotation";
     expect !Matches(r, "aabb"), "expected the precise block regex, not the wildcard fallback";
@@ -170,13 +185,15 @@ module Tests {
 
   method {:test} TestPeriodicBlockWithThreeWayChoice() {
     // Same shape as above but with three mutually exclusive alternatives at the varying
-    // position: abab/acac/adad -> (?:a(?:b|c|d))+.
+    // position: abab/acac/adad -> (?:a(?:b|c|d)){1,2}, since every sample has exactly 2
+    // repetitions (maxK=2).
     CheckOneSet({"abab", "acac", "adad"}, "periodic block with three-way internal choice");
     var r := Infer({"abab", "acac", "adad"});
     expect Matches(r, "abab");
     expect Matches(r, "acac");
     expect Matches(r, "adad");
-    expect Matches(r, "abacad"), "expected mixed repetitions across all three alternatives";
+    expect Matches(r, "abac"), "expected mixing two of the three alternatives across the 2 observed repetitions to be accepted";
+    expect !Matches(r, "abacad"), "expected the tight bound (maxK=2) to reject a 3rd repetition";
     expect !Matches(r, "bb"), "expected the block regex to reject a run without the shared 'a'";
     expect !Matches(r, "aabb"), "expected the precise block regex, not the wildcard fallback";
   }
@@ -307,9 +324,13 @@ module Tests {
     expect !Matches(r, "bc"), "expected the {a,b} and {c,d} groups not to mix symbols";
     expect !Matches(r, "bd"), "expected the {a,b} and {c,d} groups not to mix symbols";
 
-    // The {a,b} group still needs its own local wildcard (a,b genuinely conflict), so it
-    // should still accept combinations "ab"/"ba" alone could never justify, like "aabb".
-    expect Matches(r, "aabb"), "expected the {a,b} component to still be its own local wildcard";
+    // The {a,b} group still needs its own local wildcard-like fallback (a,b genuinely
+    // conflict) - here a degenerate periodic block with period 1, tightly bounded to
+    // maxK=2 (both "ab" and "ba" are length 2) - so it accepts combinations "ab"/"ba"
+    // alone could never justify, like "aa" (still within the length-2 bound), but no
+    // longer "aabb" (length 4, past the tight bound).
+    expect Matches(r, "aa"), "expected the {a,b} component to still over-generalize within its tight bound";
+    expect !Matches(r, "aabb"), "expected the {a,b} component's tight bound to reject aabb (needs 4 reps, more than any sample's 2)";
 
     // The {c,d} group has only one sample and no conflict, so it takes the chain path;
     // with the Slot refinement, a single non-repeating sample now yields the exact chain
@@ -332,11 +353,15 @@ module Tests {
   method {:test} TestTwoConflictingGroupsEachGetOwnWildcard() {
     // Two SEPARATE conflicts over disjoint alphabets: {a,b} conflicts (ab/ba) and,
     // independently, {x,y} conflicts (xy/yx). Each group falls back to its own local
-    // wildcard, but the two wildcards must never mix symbols with each other.
+    // wildcard-like fallback (a period-1 periodic block, tightly bounded to maxK=2 since
+    // every sample is length 2), but the two must never mix symbols with each other, and
+    // neither should accept more repetitions than its own samples ever showed.
     CheckOneSet({"ab", "ba", "xy", "yx"}, "two independent conflicting groups");
     var r := Infer({"ab", "ba", "xy", "yx"});
-    expect Matches(r, "aabb"), "expected the {a,b} group's own local wildcard";
-    expect Matches(r, "xxyy"), "expected the {x,y} group's own local wildcard";
+    expect Matches(r, "aa"), "expected the {a,b} group to still over-generalize within its tight bound";
+    expect Matches(r, "xx"), "expected the {x,y} group to still over-generalize within its tight bound";
+    expect !Matches(r, "aabb"), "expected the {a,b} group's tight bound (maxK=2) to reject aabb";
+    expect !Matches(r, "xxyy"), "expected the {x,y} group's tight bound (maxK=2) to reject xxyy";
     expect !Matches(r, "ax"), "expected the two conflicting groups to stay disjoint";
     expect !Matches(r, "ay"), "expected the two conflicting groups to stay disjoint";
   }
@@ -619,6 +644,221 @@ module Tests {
       }
       var sore := CheckSingleOccurrence(r, alphabet);
       expect sore, "periodic fuzz: Infer result was not single-occurrence at trial " + Fmt(trial);
+
+      trial := trial + 1;
+    }
+  }
+
+  // ---- Fuzz coverage for the tight RepRange bound itself (tier 2's maxK, tier 3's
+  // maxLen), added alongside the switch from unbounded Plus/Star to bounded RepRange.
+  // These fuzz the CONSTRUCTIONS directly (BlockPieces/UnionAll + MaxKForPeriod/MaxLen +
+  // RepRange), rather than routing through the full multi-tier Infer() pipeline: which
+  // tier the full pipeline picks for a given random sample set also depends on tier 0
+  // (prefix/suffix) and the positional split, which would make it hard to predict, from
+  // the outside, which bound a given trial is even supposed to be exercising. Testing
+  // the tier-2/tier-3 constructions directly still gives real coverage of exactly what
+  // changed, and for each trial checks both halves the task calls for: (1) soundness -
+  // every generated sample is still accepted, and (2) tightness - one MORE repetition
+  // than the computed bound allows is genuinely rejected, not just "some bound that
+  // happens to work". The tightness probe is airtight by construction, not by luck:
+  // BlockPieces(Sigmas) (tier 2) and UnionAll(cs) (tier 3) both consume a fixed, nonzero
+  // number of characters per repetition (p and 1 respectively), so MatchesKCopies's own
+  // definition forces the repetition count for a string of a given length to be
+  // determined by that length alone - meaning a probe one length-unit past the computed
+  // bound cannot possibly be reached by any *other*, smaller, in-bounds count either. ----
+
+  // Builds Sigmas of length p, position j drawn from two disjoint characters starting at
+  // pool index 2*j (so distinct positions never accidentally share a character), each
+  // position getting either just the first of its two characters or both - a coin flip
+  // per position - so some trials exercise tier 2's per-position "choice" (like
+  // abab/acac) and some exercise the plain single-literal-block case (like plain abab).
+  function CharPool(idx: nat): char {
+    var alphabet := "abcdefghijklmnopqrstuvwxyz";
+    alphabet[idx % 26]
+  }
+
+  method BuildRandomSigmas(seed: nat, p: nat) returns (Sigmas: seq<seq<char>>, nextSeed: nat)
+    requires p >= 1
+    ensures |Sigmas| == p
+    ensures forall j :: 0 <= j < |Sigmas| ==> Sigmas[j] != []
+  {
+    Sigmas := [];
+    var cur := seed;
+    var j := 0;
+    while j < p
+      invariant 0 <= j <= p
+      invariant |Sigmas| == j
+      invariant forall k :: 0 <= k < |Sigmas| ==> Sigmas[k] != []
+    {
+      cur := NextSeed(cur);
+      var c1 := CharPool(2 * j);
+      var sigma := if cur % 2 == 0 then [c1, CharPool(2 * j + 1)] else [c1];
+      Sigmas := Sigmas + [sigma];
+      j := j + 1;
+    }
+    nextSeed := NextSeed(cur + 41);
+  }
+
+  // Builds 1..maxSamples samples, each a concatenation of 1..maxReps repetitions of the
+  // p-position block, independently re-choosing (per repetition, per position) which of
+  // that position's alternatives to use - exactly the shape FitsPeriodChoice accepts.
+  method BuildRandomPeriodicSamples(seed: nat, p: nat, Sigmas: seq<seq<char>>, maxSamples: nat, maxReps: nat)
+    returns (strs: seq<string>, nextSeed: nat)
+    requires p >= 1
+    requires |Sigmas| == p
+    requires forall j :: 0 <= j < p ==> Sigmas[j] != []
+    requires maxReps >= 1
+    requires maxSamples >= 1
+  {
+    var numSamples := seed % maxSamples + 1;
+    strs := [];
+    var cur := seed;
+    var i := 0;
+    while i < numSamples
+      invariant 0 <= i <= numSamples
+      invariant cur >= 0
+    {
+      cur := NextSeed(cur);
+      var reps := cur % maxReps + 1;
+      var s := "";
+      var k := 0;
+      while k < reps
+        invariant 0 <= k <= reps
+        invariant cur >= 0
+      {
+        var j := 0;
+        while j < p
+          invariant 0 <= j <= p
+          invariant cur >= 0
+        {
+          cur := NextSeed(cur);
+          s := s + [Sigmas[j][cur % |Sigmas[j]|]];
+          j := j + 1;
+        }
+        k := k + 1;
+      }
+      strs := strs + [s];
+      i := i + 1;
+    }
+    nextSeed := NextSeed(cur + 43);
+  }
+
+  // `reps` copies of the block, always picking each position's first alternative -
+  // always constructible (every Sigmas[j] is nonempty) regardless of which alternatives
+  // any particular fuzz trial's samples happened to use.
+  method BuildBlockRepeat(Sigmas: seq<seq<char>>, reps: nat) returns (s: string)
+    requires forall j :: 0 <= j < |Sigmas| ==> Sigmas[j] != []
+  {
+    s := "";
+    var k := 0;
+    while k < reps
+      invariant 0 <= k <= reps
+    {
+      var j := 0;
+      while j < |Sigmas|
+        invariant 0 <= j <= |Sigmas|
+      {
+        s := s + [Sigmas[j][0]];
+        j := j + 1;
+      }
+      k := k + 1;
+    }
+  }
+
+  method {:test} FuzzPeriodicTightBound() {
+    var seed := 4242;
+    var trial := 0;
+    var numTrials := 200;
+    while trial < numTrials
+      invariant 0 <= trial <= numTrials
+    {
+      var p := seed % 3 + 1;
+      var Sigmas;
+      Sigmas, seed := BuildRandomSigmas(seed, p);
+      var strs;
+      strs, seed := BuildRandomPeriodicSamples(seed, p, Sigmas, 4, 4);
+
+      var maxK := MaxKForPeriod(strs, p);
+      var r := RepRange(BlockPieces(Sigmas), 1, maxK);
+
+      var i := 0;
+      while i < |strs|
+        invariant 0 <= i <= |strs|
+      {
+        expect Matches(r, strs[i]),
+          "periodic tight-bound fuzz: rejected an original sample at trial " + Fmt(trial);
+        i := i + 1;
+      }
+
+      var probe := BuildBlockRepeat(Sigmas, maxK + 1);
+      expect !Matches(r, probe),
+        "periodic tight-bound fuzz: bound was looser than necessary (accepted maxK+1 repetitions) at trial " + Fmt(trial);
+
+      trial := trial + 1;
+    }
+  }
+
+  // Same shape of check for tier 3's wildcard fallback: random strings over a small
+  // fixed alphabet, checked against RepRange(UnionAll(cs), 0, MaxLen(strs)) directly.
+  method BuildRandomWildcardSamples(seed: nat, alpha: seq<char>, maxSamples: nat, maxLen: nat)
+    returns (strs: seq<string>, nextSeed: nat)
+    requires alpha != []
+  {
+    var numSamples := seed % (maxSamples + 1);
+    strs := [];
+    var cur := seed;
+    var i := 0;
+    while i < numSamples
+      invariant 0 <= i <= numSamples
+      invariant cur >= 0
+    {
+      cur := NextSeed(cur);
+      var len := cur % (maxLen + 1);
+      var s := "";
+      var k := 0;
+      while k < len
+        invariant 0 <= k <= len
+        invariant cur >= 0
+      {
+        cur := NextSeed(cur);
+        s := s + [alpha[cur % |alpha|]];
+        k := k + 1;
+      }
+      strs := strs + [s];
+      i := i + 1;
+    }
+    nextSeed := NextSeed(cur + 47);
+  }
+
+  method {:test} FuzzWildcardTightBound() {
+    var seed := 9001;
+    var trial := 0;
+    var numTrials := 200;
+    var alpha := ['a', 'b', 'c'];
+    while trial < numTrials
+      invariant 0 <= trial <= numTrials
+    {
+      var strs;
+      strs, seed := BuildRandomWildcardSamples(seed, alpha, 5, 6);
+
+      var maxLen := MaxLen(strs);
+      var r := RepRange(UnionAll(alpha), 0, maxLen);
+
+      var i := 0;
+      while i < |strs|
+        invariant 0 <= i <= |strs|
+      {
+        expect Matches(r, strs[i]),
+          "wildcard tight-bound fuzz: rejected an original sample at trial " + Fmt(trial);
+        i := i + 1;
+      }
+
+      // maxLen+1 copies of a single alphabet character: same length argument as
+      // BuildBlockRepeat above, specialized to UnionAll's one-character-per-repetition
+      // shape - guaranteed past the bound and so guaranteed rejected.
+      var probe := Repeat(alpha[0], maxLen + 1);
+      expect !Matches(r, probe),
+        "wildcard tight-bound fuzz: bound was looser than necessary (accepted maxLen+1 length) at trial " + Fmt(trial);
 
       trial := trial + 1;
     }

@@ -260,7 +260,10 @@ module Chain {
   }
 
   // Plus(r)'s existential witness for s is directly also a witness for Star(r)'s second
-  // disjunct: both bodies are syntactically the same existential.
+  // disjunct: both bodies are syntactically the same existential. (No longer used by
+  // the periodic-block tier below, now that it targets a tight RepRange instead of an
+  // unbounded Plus/Star - kept as a small general-purpose fact about the two
+  // constructors' semantics.)
   lemma PlusImpliesStar(r: Regex, s: string)
     requires Matches(Plus(r), s)
     ensures Matches(Star(r), s)
@@ -288,13 +291,20 @@ module Chain {
   // one literal block repeated" (which only ever let every repetition look identical) to
   // "t is exactly p characters repeated, where position i within each repetition is drawn
   // from its own alphabet Sigmas[i]" - e.g. "abab"/"acac" share period 2 with position 0
-  // always 'a' and position 1 either 'b' or 'c', giving (?:a(?:b|c))+ instead of a full
-  // wildcard. Reduces to the old literal-only behavior exactly when every Sigmas[i] is a
-  // singleton. Like everywhere else in this project, the *only* correctness-critical
+  // always 'a' and position 1 either 'b' or 'c', giving (?:a(?:b|c)){1,2} instead of a
+  // full wildcard. Reduces to the old literal-only behavior exactly when every Sigmas[i]
+  // is a singleton. Like everywhere else in this project, the *only* correctness-critical
   // condition is checked explicitly (pairwise disjointness across positions, so each
   // position's choice can be its own Union without breaking single-occurrence) - which
   // period `p` and which alphabets to propose is a pure heuristic with no burden beyond
-  // producing *some* candidate. ----
+  // producing *some* candidate.
+  //
+  // The repeat count is tightly bounded, not unbounded: FitsPeriodChoiceKCopies below
+  // establishes that a fitting t decomposes into exactly PeriodRepCount(t, p) copies of
+  // the block (MatchesKCopies), which Infer.dfy uses - via MaxKForPeriod's fold over the
+  // whole sample batch, and Regex.dfy's MatchesKCopiesImpliesRepRange - to build
+  // RepRange(BlockPieces(Sigmas), 1, maxK) instead of the old unbounded
+  // Plus(BlockPieces(Sigmas)). ----
 
   // Build the block-with-choice regex: position i of the (single) repeated unit matches
   // whichever character was proposed for it, drawn from Sigmas[i].
@@ -351,10 +361,37 @@ module Chain {
       else headOk && FitsPeriodChoice(t[p..], p, Sigmas)
   }
 
-  lemma FitsPeriodChoiceSound(t: string, p: nat, Sigmas: seq<seq<char>>)
+  // Number of period-p repetitions needed to exactly cover t, computed by simple
+  // recursive countdown (peel off one block of length p at a time, stop once at most
+  // one block's worth remains). Total for any p >= 1 and any t, but only meaningful as
+  // "the" repetition count for t's that actually satisfy FitsPeriodChoice(t, p, _): for
+  // those, FitsPeriodChoice's own recursion bottoms out at exactly |t| == p (never at
+  // some in-between remainder - see the comment on FitsPeriodChoice itself), so this
+  // recursion's remaining length is always exactly p at the base case too, and the
+  // result is exactly |t| / p (with zero remainder) - though that division fact is never
+  // needed as a lemma, since this recursive definition already computes the same count
+  // FitsPeriodChoiceKCopies below builds its MatchesKCopies witness around, with no `/`
+  // or `%` reasoning anywhere. Used both to state that witness's exact copy-count and,
+  // in Infer.dfy, to fold over every sample's own count to find the tightest overall
+  // upper bound for RepRange.
+  function PeriodRepCount(t: string, p: nat): nat
+    requires p >= 1
+    decreases |t|
+  {
+    if |t| <= p then 1 else 1 + PeriodRepCount(t[p..], p)
+  }
+
+  // t decomposes into exactly PeriodRepCount(t, p) concatenated copies of
+  // BlockPieces(Sigmas)'s language - the bridge to RepRange via
+  // MatchesKCopiesImpliesRepRange (Regex.dfy), replacing the old unbounded
+  // Matches(Plus(BlockPieces(Sigmas)), t) conclusion this lemma used to prove: the two
+  // are equally easy to establish (same induction on |t|, peeling one block off the
+  // front each step), but MatchesKCopies additionally exposes the *exact* count, which
+  // Plus's own semantics threw away.
+  lemma FitsPeriodChoiceKCopies(t: string, p: nat, Sigmas: seq<seq<char>>)
     requires p >= 1 && |Sigmas| == p
     requires FitsPeriodChoice(t, p, Sigmas)
-    ensures Matches(Plus(BlockPieces(Sigmas)), t)
+    ensures MatchesKCopies(BlockPieces(Sigmas), t, PeriodRepCount(t, p))
     decreases |t|
   {
     assert |t| >= p;
@@ -362,20 +399,23 @@ module Chain {
     HeadFitsBlockPieces(t, Sigmas);
     assert Matches(BlockPieces(Sigmas), t[..p]);
     if |t| == p {
+      assert PeriodRepCount(t, p) == 1;
       assert t[..p] == t;
-      PlusSoundOne(BlockPieces(Sigmas), t);
+      assert MatchesKCopies(BlockPieces(Sigmas), t, 1) by {
+        assert t[p..] == "";
+        assert 0 <= p <= |t| && Matches(BlockPieces(Sigmas), t[..p]) && MatchesKCopies(BlockPieces(Sigmas), t[p..], 0);
+      }
     } else {
       assert |t| > p;
       var rest := t[p..];
       assert FitsPeriodChoice(rest, p, Sigmas);
-      FitsPeriodChoiceSound(rest, p, Sigmas);
-      assert Matches(Plus(BlockPieces(Sigmas)), rest);
-      PlusImpliesStar(BlockPieces(Sigmas), rest);
-      assert Matches(Star(BlockPieces(Sigmas)), rest);
-      assert Matches(Plus(BlockPieces(Sigmas)), t) by {
-        assert 0 < p <= |t| &&
+      FitsPeriodChoiceKCopies(rest, p, Sigmas);
+      assert MatchesKCopies(BlockPieces(Sigmas), rest, PeriodRepCount(rest, p));
+      assert PeriodRepCount(t, p) == 1 + PeriodRepCount(rest, p);
+      assert MatchesKCopies(BlockPieces(Sigmas), t, PeriodRepCount(t, p)) by {
+        assert 0 <= p <= |t| &&
           Matches(BlockPieces(Sigmas), t[..p]) &&
-          Matches(Star(BlockPieces(Sigmas)), t[p..]);
+          MatchesKCopies(BlockPieces(Sigmas), t[p..], PeriodRepCount(t, p) - 1);
       }
     }
   }
@@ -486,20 +526,30 @@ module Chain {
     }
   }
 
+  // Note: this establishes IsSore of the *bare* block, not of any repetition wrapper
+  // around it - callers now wrap it in RepRange (via Regex.dfy's RepRangeIsSore) rather
+  // than the old unbounded Plus, since RepRangeIsSore/PlusIsSore both reduce to exactly
+  // this same fact about BlockPieces(Sigmas) itself (repetition wrappers never add or
+  // remove symbols - see Symbols's RepRange/Plus cases in Regex.dfy).
   lemma PeriodicChoiceIsSore(Sigmas: seq<seq<char>>)
     requires forall j :: 0 <= j < |Sigmas| ==> NoDup(Sigmas[j])
     requires SigmasPairwiseDisjoint(Sigmas)
-    ensures IsSore(Plus(BlockPieces(Sigmas)))
+    ensures IsSore(BlockPieces(Sigmas))
   {
     BlockPiecesSymbols(Sigmas);
     SigmasNoDupBound(Sigmas);
     assert forall c :: Symbols(BlockPieces(Sigmas))[c] <= 1;
-    PlusIsSore(BlockPieces(Sigmas));
   }
 
-  // ---- Wildcard building block: Star over the union of Sym(c) for c in cs. (Moved here
-  // from Infer.dfy so the new Slot machinery below - which also needs UnionAll, for
-  // choice slots - can use it without a circular include.) ----
+  // ---- Wildcard building block: the union of Sym(c) for c in cs, repeated a tightly
+  // bounded number of times (RepRange(UnionAll(cs), 0, maxLen), built in Infer.dfy - see
+  // UnionKCopies/MaxLen below) rather than unboundedly (the old Star(UnionAll(cs))): every
+  // sample t reaching this tier 3 fallback has some known length |t|, and UnionKCopies
+  // shows t decomposes into exactly |t| one-character copies of UnionAll(cs) (via
+  // MatchesKCopies), so the longest sample's length - maxLen, folded over the whole batch
+  // by MaxLen - is the most repetitions RepRange ever needs to allow. (Moved here from
+  // Infer.dfy so the new Slot machinery below - which also needs UnionAll, for choice
+  // slots - can use it without a circular include.) ----
 
   function UnionAll(cs: seq<char>): Regex
     decreases cs
@@ -548,10 +598,16 @@ module Chain {
     NoDupMultisetBound(cs);
   }
 
-  lemma UnionStarSound(cs: seq<char>, alpha: set<char>, t: string)
+  // t decomposes into exactly |t| concatenated one-character copies of UnionAll(cs)'s
+  // language - the bridge to RepRange via MatchesKCopiesImpliesRepRange (Regex.dfy),
+  // replacing the old unbounded Matches(Star(UnionAll(cs)), t) conclusion this lemma
+  // used to prove: the induction is the same character-by-character walk down t (so it
+  // was already, in effect, counting |t| repetitions), just restated to expose that
+  // exact count instead of discarding it into Star's unbounded semantics.
+  lemma UnionKCopies(cs: seq<char>, alpha: set<char>, t: string)
     requires multiset(cs) == multiset(alpha)
     requires forall i :: 0 <= i < |t| ==> t[i] in alpha
-    ensures Matches(Star(UnionAll(cs)), t)
+    ensures MatchesKCopies(UnionAll(cs), t, |t|)
     decreases |t|
   {
     if t == "" {
@@ -566,11 +622,60 @@ module Chain {
       forall i | 0 <= i < |t[1..]| ensures t[1..][i] in alpha {
         assert t[1..][i] == t[i + 1];
       }
-      UnionStarSound(cs, alpha, t[1..]);
-      assert Matches(Star(UnionAll(cs)), t[1..]);
-      assert Matches(Star(UnionAll(cs)), t) by {
-        assert 0 < 1 <= |t| && Matches(UnionAll(cs), t[..1]) && Matches(Star(UnionAll(cs)), t[1..]);
+      UnionKCopies(cs, alpha, t[1..]);
+      assert MatchesKCopies(UnionAll(cs), t[1..], |t[1..]|);
+      assert MatchesKCopies(UnionAll(cs), t, |t|) by {
+        assert 0 <= 1 <= |t| && Matches(UnionAll(cs), t[..1]) && MatchesKCopies(UnionAll(cs), t[1..], |t| - 1);
       }
+    }
+  }
+
+  // ---- Tight-bound folds: the smallest RepRange upper bound that still covers every
+  // sample in a batch, computed directly from that batch (never a universal constant).
+  // Used by both tiers above: tier 2's period-block count (PeriodRepCount, per sample)
+  // folds to maxK below; tier 3's per-sample length folds to maxLen further below. ----
+
+  function MaxKForPeriod(strs: seq<string>, p: nat): nat
+    requires p >= 1
+    decreases strs
+  {
+    if strs == [] then 1
+    else
+      var restMax := MaxKForPeriod(strs[1..], p);
+      var k0 := PeriodRepCount(strs[0], p);
+      if k0 > restMax then k0 else restMax
+  }
+
+  lemma MaxKForPeriodBound(strs: seq<string>, p: nat, t: string)
+    requires p >= 1
+    requires t in strs
+    ensures PeriodRepCount(t, p) <= MaxKForPeriod(strs, p)
+    decreases strs
+  {
+    if strs[0] == t {
+    } else {
+      MaxKForPeriodBound(strs[1..], p, t);
+    }
+  }
+
+  function MaxLen(strs: seq<string>): nat
+    decreases strs
+  {
+    if strs == [] then 0
+    else
+      var restMax := MaxLen(strs[1..]);
+      var m0 := |strs[0]|;
+      if m0 > restMax then m0 else restMax
+  }
+
+  lemma MaxLenBound(strs: seq<string>, t: string)
+    requires t in strs
+    ensures |t| <= MaxLen(strs)
+    decreases strs
+  {
+    if strs[0] == t {
+    } else {
+      MaxLenBound(strs[1..], t);
     }
   }
 
